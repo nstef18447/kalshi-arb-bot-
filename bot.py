@@ -1,6 +1,8 @@
 import time
 import logging
 import threading
+from collections import deque
+from datetime import datetime, timezone
 
 import config
 import kalshi_api
@@ -8,16 +10,39 @@ import kalshi_api
 logger = logging.getLogger("arb-bot")
 
 
+def _is_filled(order: dict) -> bool:
+    return order.get("status") == "filled" or order.get("remaining_count", 1) == 0
+
+
+def _wait_for_fill(order_id: str, timeout: float) -> dict:
+    """Poll an order until filled or timeout. Returns final order state."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        order = kalshi_api.get_order(order_id)
+        if _is_filled(order):
+            return order
+        time.sleep(0.3)
+    return kalshi_api.get_order(order_id)
+
+
 class ArbBot:
     def __init__(self):
         self.traded_tickers: set[str] = set()
         self.running = False
+        self.paused_until: float = 0
+        # Rolling window: deque of bools (True = success, False = orphan)
+        self.results: deque[bool] = deque(maxlen=config.WINDOW_SIZE)
 
     def start(self):
         self.running = True
         logger.info("Bot started — scanning %s series", config.SERIES)
         while self.running:
             try:
+                if time.monotonic() < self.paused_until:
+                    remaining = int(self.paused_until - time.monotonic())
+                    logger.info("Circuit breaker active — %ds remaining", remaining)
+                    time.sleep(config.POLL_INTERVAL)
+                    continue
                 self._scan_cycle()
             except KeyboardInterrupt:
                 break
@@ -28,6 +53,10 @@ class ArbBot:
     def stop(self):
         self.running = False
         logger.info("Bot stopping...")
+
+    # ------------------------------------------------------------------
+    # Scan cycle — unchanged entry criteria
+    # ------------------------------------------------------------------
 
     def _scan_cycle(self):
         for series in config.SERIES:
@@ -41,7 +70,6 @@ class ArbBot:
                 logger.info("Clearing settled tickers: %s", settled)
                 self.traded_tickers -= settled
 
-            # Check exposure before scanning
             if not self._check_exposure():
                 logger.warning("Max exposure reached, skipping scan")
                 return
@@ -50,13 +78,12 @@ class ArbBot:
                 ticker = market["ticker"]
                 if ticker in self.traded_tickers:
                     continue
-
                 self._evaluate_market(ticker)
 
     def _evaluate_market(self, ticker: str):
-        """Check a single market for arb opportunity and execute if found."""
+        """Check a single market for arb opportunity."""
         try:
-            book = kalshi_api.get_orderbook(ticker, depth=1)
+            book = kalshi_api.get_orderbook(ticker, depth=5)
         except Exception:
             logger.exception("Failed to fetch orderbook for %s", ticker)
             return
@@ -67,116 +94,225 @@ class ArbBot:
         if not yes_asks or not no_asks:
             return
 
-        # Orderbook returns [[price, quantity], ...] sorted best first
         best_yes_ask = yes_asks[0][0]
+        best_yes_depth = yes_asks[0][1]
         best_no_ask = no_asks[0][0]
+        best_no_depth = no_asks[0][1]
         combined = best_yes_ask + best_no_ask
 
         if combined <= config.ARB_THRESHOLD:
             profit_cents = 100 - combined
             logger.info(
-                "ARB DETECTED on %s: Yes=%d + No=%d = %d (profit=%d cents/contract)",
-                ticker, best_yes_ask, best_no_ask, combined, profit_cents,
+                "ARB DETECTED on %s: Yes=%d(%dq) + No=%d(%dq) = %d (profit=%d cents/contract)",
+                ticker, best_yes_ask, best_yes_depth, best_no_ask, best_no_depth,
+                combined, profit_cents,
             )
-            self._execute_arb(ticker, best_yes_ask, best_no_ask)
+            self._execute_arb(ticker, best_yes_ask, best_yes_depth, best_no_ask, best_no_depth)
         else:
             logger.debug(
                 "%s: Yes=%d + No=%d = %d (no arb)", ticker, best_yes_ask, best_no_ask, combined
             )
 
-    def _execute_arb(self, ticker: str, yes_price: int, no_price: int):
-        """Place both legs and monitor fills."""
-        # Block this ticker immediately to prevent duplicates (Fix #1)
-        self.traded_tickers.add(ticker)
+    # ------------------------------------------------------------------
+    # Execution — sequential leg placement with all 5 improvements
+    # ------------------------------------------------------------------
 
+    def _execute_arb(self, ticker: str, yes_price: int, yes_depth: int,
+                     no_price: int, no_depth: int):
+        now = datetime.now(timezone.utc).strftime("%H:%M:%S")
         count = config.MAX_CONTRACTS
-        logger.info("Placing arb on %s: %d contracts Yes@%d + No@%d", ticker, count, yes_price, no_price)
 
-        try:
-            yes_order = kalshi_api.create_order(ticker, "yes", yes_price, count)
-            no_order = kalshi_api.create_order(ticker, "no", no_price, count)
-        except Exception:
-            logger.exception("Failed to place orders for %s", ticker)
-            # If we failed to place, allow retry
-            self.traded_tickers.discard(ticker)
-            return
-
-        yes_id = yes_order.get("order_id", "")
-        no_id = no_order.get("order_id", "")
-        logger.info("Orders placed — Yes: %s, No: %s", yes_id, no_id)
-
-        # Start fill monitoring in a background thread so the main loop isn't blocked
-        thread = threading.Thread(
-            target=self._monitor_fills,
-            args=(ticker, yes_id, no_id, yes_price, no_price),
-            daemon=True,
-        )
-        thread.start()
-
-    def _monitor_fills(self, ticker: str, yes_id: str, no_id: str, yes_price: int, no_price: int):
-        """Monitor fill status and handle partial fills (Fix #3)."""
-        # Wait before first check
-        time.sleep(config.FILL_CHECK_DELAY)
-
-        yes_order = kalshi_api.get_order(yes_id)
-        no_order = kalshi_api.get_order(no_id)
-
-        yes_filled = yes_order.get("status") == "filled" or yes_order.get("remaining_count", 1) == 0
-        no_filled = no_order.get("status") == "filled" or no_order.get("remaining_count", 1) == 0
-
-        if yes_filled and no_filled:
-            profit = 100 - yes_price - no_price
+        # --- 1. PRE-FLIGHT LIQUIDITY CHECK ---
+        if yes_depth < config.MIN_DEPTH:
             logger.info(
-                "BOTH LEGS FILLED on %s — locked in %d cents/contract profit", ticker, profit
+                "[%s] %s SKIP: Yes depth %d < MIN_DEPTH %d",
+                now, ticker, yes_depth, config.MIN_DEPTH,
+            )
+            return
+        if no_depth < config.MIN_DEPTH:
+            logger.info(
+                "[%s] %s SKIP: No depth %d < MIN_DEPTH %d",
+                now, ticker, no_depth, config.MIN_DEPTH,
             )
             return
 
-        if yes_filled and not no_filled:
-            logger.warning("ONE-SIDED FILL on %s: Yes filled, No open — cancelling No", ticker)
-            self._safe_cancel(no_id)
-            logger.warning("UNHEDGED EXPOSURE on %s: holding Yes@%d with no hedge", ticker, yes_price)
-            return
+        # Block ticker to prevent duplicates
+        self.traded_tickers.add(ticker)
 
-        if no_filled and not yes_filled:
-            logger.warning("ONE-SIDED FILL on %s: No filled, Yes open — cancelling Yes", ticker)
-            self._safe_cancel(yes_id)
-            logger.warning("UNHEDGED EXPOSURE on %s: holding No@%d with no hedge", ticker, no_price)
-            return
-
-        # Neither filled — wait until safety deadline then cancel both
-        remaining_wait = config.SAFETY_CANCEL_DELAY - config.FILL_CHECK_DELAY
-        if remaining_wait > 0:
-            time.sleep(remaining_wait)
-
-        # Re-check before cancelling
-        yes_order = kalshi_api.get_order(yes_id)
-        no_order = kalshi_api.get_order(no_id)
-
-        yes_filled = yes_order.get("status") == "filled" or yes_order.get("remaining_count", 1) == 0
-        no_filled = no_order.get("status") == "filled" or no_order.get("remaining_count", 1) == 0
-
-        if yes_filled and no_filled:
-            profit = 100 - yes_price - no_price
-            logger.info("BOTH LEGS FILLED (late) on %s — %d cents/contract profit", ticker, profit)
-            return
-
-        if not yes_filled and not no_filled:
-            logger.info("Neither leg filled on %s — cancelling both, allowing retry", ticker)
-            self._safe_cancel(yes_id)
-            self._safe_cancel(no_id)
-            self.traded_tickers.discard(ticker)  # Allow retry since nothing filled
-            return
-
-        # One filled during the extra wait — cancel the other
-        if yes_filled:
-            self._safe_cancel(no_id)
-            logger.warning("UNHEDGED EXPOSURE on %s: Yes filled, No cancelled at safety deadline", ticker)
+        # --- 2. LEG THE ILLIQUID SIDE FIRST ---
+        if yes_depth <= no_depth:
+            first_side, first_price, first_depth = "yes", yes_price, yes_depth
+            second_side, second_price, second_depth = "no", no_price, no_depth
         else:
-            self._safe_cancel(yes_id)
-            logger.warning("UNHEDGED EXPOSURE on %s: No filled, Yes cancelled at safety deadline", ticker)
+            first_side, first_price, first_depth = "no", no_price, no_depth
+            second_side, second_price, second_depth = "yes", yes_price, yes_depth
+
+        logger.info(
+            "[%s] %s EXEC: first=%s@%d(depth=%d) second=%s@%d(depth=%d) | reason=thinner_side",
+            now, ticker, first_side, first_price, first_depth,
+            second_side, second_price, second_depth,
+        )
+
+        # Place first leg (illiquid side)
+        try:
+            first_order = kalshi_api.create_order(ticker, first_side, first_price, count)
+        except Exception:
+            logger.exception("[%s] %s FAIL: could not place first leg (%s)", now, ticker, first_side)
+            self.traded_tickers.discard(ticker)
+            return
+
+        first_id = first_order.get("order_id", "")
+        logger.info("[%s] %s FIRST LEG placed: %s order_id=%s", now, ticker, first_side, first_id)
+
+        # Wait for first leg fill
+        first_final = _wait_for_fill(first_id, config.FIRST_LEG_TIMEOUT)
+
+        if not _is_filled(first_final):
+            # First leg didn't fill — cancel and abort, no exposure
+            self._safe_cancel(first_id)
+            self.traded_tickers.discard(ticker)
+            logger.info(
+                "[%s] %s ABORT: first leg %s did not fill in %ds — cancelled, no exposure",
+                now, ticker, first_side, config.FIRST_LEG_TIMEOUT,
+            )
+            return
+
+        logger.info("[%s] %s FIRST LEG FILLED: %s@%d", now, ticker, first_side, first_price)
+
+        # --- First leg filled — place second leg immediately ---
+        try:
+            second_order = kalshi_api.create_order(ticker, second_side, second_price, count)
+        except Exception:
+            logger.exception("[%s] %s FAIL: could not place second leg (%s)", now, ticker, second_side)
+            self._handle_orphan(ticker, first_side, first_price, count, now)
+            return
+
+        second_id = second_order.get("order_id", "")
+        logger.info("[%s] %s SECOND LEG placed: %s order_id=%s", now, ticker, second_side, second_id)
+
+        # Wait for second leg fill
+        second_final = _wait_for_fill(second_id, config.SECOND_LEG_TIMEOUT)
+
+        if _is_filled(second_final):
+            # --- SUCCESS: both legs filled ---
+            profit = 100 - yes_price - no_price
+            self.results.append(True)
+            logger.info(
+                "[%s] %s SUCCESS: both legs filled — %d cents/contract profit | "
+                "orphan_rate=%.2f (%d/%d)",
+                now, ticker, profit, self._orphan_rate(),
+                self._orphan_count(), len(self.results),
+            )
+            return
+
+        # --- 3. ORPHAN FILL RECOVERY: second leg didn't fill ---
+        logger.warning(
+            "[%s] %s ORPHAN: %s filled but %s did not fill in %ds",
+            now, ticker, first_side, second_side, config.SECOND_LEG_TIMEOUT,
+        )
+        self._safe_cancel(second_id)
+        self._handle_orphan(ticker, first_side, first_price, count, now)
+
+    # ------------------------------------------------------------------
+    # Orphan recovery — exit the filled leg immediately
+    # ------------------------------------------------------------------
+
+    def _handle_orphan(self, ticker: str, filled_side: str, fill_price: int,
+                       count: int, now: str):
+        """Exit the orphaned position by selling at best bid."""
+        self.results.append(False)
+
+        # Fetch current book to get best bid for our side
+        try:
+            book = kalshi_api.get_orderbook(ticker, depth=1)
+        except Exception:
+            logger.exception(
+                "[%s] %s ORPHAN EXIT FAILED: could not fetch orderbook for exit", now, ticker
+            )
+            self._check_circuit_breaker(now)
+            return
+
+        # Best bid for the side we're holding — that's what we can sell into
+        # If we hold Yes, we sell Yes, so we need the Yes bid (best buyer)
+        # Kalshi orderbook: "yes" key has ask levels, bids are implicit via "no" asks
+        # Best Yes bid = 100 - best No ask; Best No bid = 100 - best Yes ask
+        if filled_side == "yes":
+            no_asks = book.get("no", [])
+            if no_asks:
+                exit_price = 100 - no_asks[0][0]
+            else:
+                exit_price = 1  # Worst case: dump at 1 cent
+        else:
+            yes_asks = book.get("yes", [])
+            if yes_asks:
+                exit_price = 100 - yes_asks[0][0]
+            else:
+                exit_price = 1
+
+        logger.warning(
+            "[%s] %s ORPHAN EXIT: selling %d %s contracts — fill_price=%d exit_price=%d",
+            now, ticker, count, filled_side, fill_price, exit_price,
+        )
+
+        try:
+            sell_order = kalshi_api.create_sell_order(ticker, filled_side, exit_price, count)
+            sell_id = sell_order.get("order_id", "")
+            # Give the sell a few seconds to fill
+            sell_final = _wait_for_fill(sell_id, config.SECOND_LEG_TIMEOUT)
+            if _is_filled(sell_final):
+                realized_pnl = exit_price - fill_price
+                logger.warning(
+                    "[%s] %s ORPHAN CLOSED: %s sold@%d (bought@%d) | P&L=%d cents/contract (%+d total) | "
+                    "orphan_rate=%.2f (%d/%d)",
+                    now, ticker, filled_side, exit_price, fill_price,
+                    realized_pnl, realized_pnl * count,
+                    self._orphan_rate(), self._orphan_count(), len(self.results),
+                )
+            else:
+                self._safe_cancel(sell_id)
+                logger.error(
+                    "[%s] %s ORPHAN EXIT INCOMPLETE: sell order %s did not fill — "
+                    "MANUAL INTERVENTION REQUIRED | holding %d %s@%d",
+                    now, ticker, sell_id, count, filled_side, fill_price,
+                )
+        except Exception:
+            logger.exception(
+                "[%s] %s ORPHAN EXIT FAILED: could not place sell order — "
+                "MANUAL INTERVENTION REQUIRED | holding %d %s@%d",
+                now, ticker, count, filled_side, fill_price,
+            )
+
+        self._check_circuit_breaker(now)
+
+    # ------------------------------------------------------------------
+    # Circuit breaker
+    # ------------------------------------------------------------------
+
+    def _orphan_count(self) -> int:
+        return sum(1 for r in self.results if not r)
+
+    def _orphan_rate(self) -> float:
+        if not self.results:
+            return 0.0
+        return self._orphan_count() / len(self.results)
+
+    def _check_circuit_breaker(self, now: str):
+        """Trip circuit breaker if orphan rate exceeds threshold."""
+        rate = self._orphan_rate()
+        if len(self.results) >= 5 and rate > config.MAX_ORPHAN_RATE:
+            self.paused_until = time.monotonic() + (config.COOLDOWN_MINUTES * 60)
+            logger.warning(
+                "[%s] CIRCUIT BREAKER TRIPPED: orphan_rate=%.2f (%d/%d) > %.2f — "
+                "pausing for %d minutes",
+                now, rate, self._orphan_count(), len(self.results),
+                config.MAX_ORPHAN_RATE, config.COOLDOWN_MINUTES,
+            )
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     def _safe_cancel(self, order_id: str):
-        """Cancel an order, ignoring errors if already filled/cancelled."""
         try:
             kalshi_api.cancel_order(order_id)
             logger.info("Cancelled order %s", order_id)
@@ -184,12 +320,10 @@ class ArbBot:
             logger.debug("Could not cancel order %s (may already be filled/cancelled)", order_id)
 
     def _check_exposure(self) -> bool:
-        """Check if current exposure is under the limit (Fix #4)."""
         try:
             positions = kalshi_api.get_positions()
             total_exposure = 0
             for pos in positions:
-                # Each position's cost is roughly contracts * avg price
                 yes_count = abs(pos.get("market_exposure", 0))
                 total_exposure += yes_count
 
@@ -201,4 +335,4 @@ class ArbBot:
             return True
         except Exception:
             logger.exception("Failed to check exposure")
-            return True  # Allow trading if we can't check (fail open)
+            return True

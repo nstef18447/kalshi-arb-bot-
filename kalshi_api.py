@@ -59,6 +59,30 @@ def create_order(ticker: str, side: str, price_cents: int, count: int) -> dict:
     return data.get("order", {})
 
 
+def create_sell_order(ticker: str, side: str, price_cents: int, count: int) -> dict:
+    """Place a limit sell order (for orphan exit).
+
+    Args:
+        ticker: Market ticker
+        side: 'yes' or 'no' — the side we're selling
+        price_cents: Limit price in cents (aggressive = best bid)
+        count: Number of contracts
+
+    Returns:
+        Order dict from API
+    """
+    body = {
+        "ticker": ticker,
+        "action": "sell",
+        "side": side,
+        "type": "limit",
+        "yes_price" if side == "yes" else "no_price": price_cents,
+        "count": count,
+    }
+    data = authenticated_request("POST", "/trade-api/v2/portfolio/orders", json_body=body)
+    return data.get("order", {})
+
+
 def get_order(order_id: str) -> dict:
     """Get order details including fill status."""
     data = authenticated_request("GET", f"/trade-api/v2/portfolio/orders/{order_id}")
