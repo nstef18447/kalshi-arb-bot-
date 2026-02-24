@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 
 import config
 import kalshi_api
+from scanner import build_ladder, detect_violations, rank_opportunities, log_ladder
 
 logger = logging.getLogger("arb-bot")
 
@@ -32,6 +33,8 @@ class ArbBot:
         self.paused_until: float = 0
         # Rolling window: deque of bools (True = success, False = orphan)
         self.results: deque[bool] = deque(maxlen=config.WINDOW_SIZE)
+        # Ladder snapshot cache: expiry -> deque of recent snapshots
+        self.snapshot_cache: dict[str, deque] = {}
 
     def start(self):
         self.running = True
@@ -74,44 +77,35 @@ class ArbBot:
                 logger.warning("Max exposure reached, skipping scan")
                 return
 
-            for market in markets:
-                ticker = market["ticker"]
-                if ticker in self.traded_tickers:
-                    continue
-                self._evaluate_market(ticker)
+            # Build ladder snapshots for all expiry windows
+            ladders = build_ladder(markets)
 
-    def _evaluate_market(self, ticker: str):
-        """Check a single market for arb opportunity."""
-        try:
-            book = kalshi_api.get_orderbook(ticker, depth=5)
-        except Exception:
-            logger.exception("Failed to fetch orderbook for %s", ticker)
-            return
+            # Cache + log + detect for each window
+            for expiry, snapshot in ladders.items():
+                self._cache_snapshot(expiry, snapshot)
+                opportunities = detect_violations(
+                    snapshot, config.FEE_RATE, config.SOFT_ARB_PROB_THRESHOLD
+                )
+                ranked = rank_opportunities(opportunities)
+                log_ladder(snapshot, ranked)
 
-        yes_asks = book.get("yes", [])
-        no_asks = book.get("no", [])
+                # Still run existing single-market arb on each strike
+                for strike in snapshot.strikes:
+                    if strike.ticker in self.traded_tickers:
+                        continue
+                    combined = strike.yes_ask + strike.no_ask
+                    if combined <= config.ARB_THRESHOLD:
+                        self._execute_arb(
+                            strike.ticker, strike.yes_ask,
+                            strike.yes_ask_depth, strike.no_ask,
+                            strike.no_ask_depth,
+                        )
 
-        if not yes_asks or not no_asks:
-            return
-
-        best_yes_ask = yes_asks[0][0]
-        best_yes_depth = yes_asks[0][1]
-        best_no_ask = no_asks[0][0]
-        best_no_depth = no_asks[0][1]
-        combined = best_yes_ask + best_no_ask
-
-        if combined <= config.ARB_THRESHOLD:
-            profit_cents = 100 - combined
-            logger.info(
-                "ARB DETECTED on %s: Yes=%d(%dq) + No=%d(%dq) = %d (profit=%d cents/contract)",
-                ticker, best_yes_ask, best_yes_depth, best_no_ask, best_no_depth,
-                combined, profit_cents,
-            )
-            self._execute_arb(ticker, best_yes_ask, best_yes_depth, best_no_ask, best_no_depth)
-        else:
-            logger.debug(
-                "%s: Yes=%d + No=%d = %d (no arb)", ticker, best_yes_ask, best_no_ask, combined
-            )
+    def _cache_snapshot(self, expiry: str, snapshot):
+        """Store snapshot in rolling cache for trend analysis."""
+        if expiry not in self.snapshot_cache:
+            self.snapshot_cache[expiry] = deque(maxlen=config.SNAPSHOT_CACHE_SIZE)
+        self.snapshot_cache[expiry].append(snapshot)
 
     # ------------------------------------------------------------------
     # Execution — sequential leg placement with all 5 improvements
@@ -232,22 +226,15 @@ class ArbBot:
             self._check_circuit_breaker(now)
             return
 
-        # Best bid for the side we're holding — that's what we can sell into
-        # If we hold Yes, we sell Yes, so we need the Yes bid (best buyer)
-        # Kalshi orderbook: "yes" key has ask levels, bids are implicit via "no" asks
-        # Best Yes bid = 100 - best No ask; Best No bid = 100 - best Yes ask
+        # Kalshi returns bids only. Best Yes bid = yes[0][0], Best No bid = no[0][0]
+        # To sell Yes, we need the best Yes bid (someone willing to buy our Yes)
+        # To sell No, we need the best No bid
         if filled_side == "yes":
-            no_asks = book.get("no", [])
-            if no_asks:
-                exit_price = 100 - no_asks[0][0]
-            else:
-                exit_price = 1  # Worst case: dump at 1 cent
+            yes_bids = book.get("yes", [])
+            exit_price = yes_bids[0][0] if yes_bids else 1
         else:
-            yes_asks = book.get("yes", [])
-            if yes_asks:
-                exit_price = 100 - yes_asks[0][0]
-            else:
-                exit_price = 1
+            no_bids = book.get("no", [])
+            exit_price = no_bids[0][0] if no_bids else 1
 
         logger.warning(
             "[%s] %s ORPHAN EXIT: selling %d %s contracts — fill_price=%d exit_price=%d",

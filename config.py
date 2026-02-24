@@ -13,3 +13,8 @@ SECOND_LEG_TIMEOUT = 3      # Seconds to wait for second leg fill
 WINDOW_SIZE = 20            # Rolling window of attempts for orphan rate calc
 MAX_ORPHAN_RATE = 0.25      # Pause bot if orphan rate exceeds this
 COOLDOWN_MINUTES = 10       # Minutes to pause when circuit breaker trips
+
+# --- Ladder scanner ---
+SNAPSHOT_CACHE_SIZE = 12        # Last N snapshots per window (12 × 5s = 60s)
+FEE_RATE = 0.07                 # Kalshi taker fee per leg (7%)
+SOFT_ARB_PROB_THRESHOLD = 0.60  # Min range probability for soft arb flag

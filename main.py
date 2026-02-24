@@ -41,8 +41,13 @@ def print_config():
     print(f"  Contracts/leg:   {config.MAX_CONTRACTS}")
     print(f"  Poll interval:   {config.POLL_INTERVAL}s")
     print(f"  Max exposure:    ${config.MAX_EXPOSURE / 100:,.2f}")
-    print(f"  Fill check:      {config.FILL_CHECK_DELAY}s")
-    print(f"  Safety cancel:   {config.SAFETY_CANCEL_DELAY}s")
+    print(f"  Min depth:       {config.MIN_DEPTH} contracts")
+    print(f"  1st leg timeout: {config.FIRST_LEG_TIMEOUT}s")
+    print(f"  2nd leg timeout: {config.SECOND_LEG_TIMEOUT}s")
+    print(f"  Circuit breaker: {config.MAX_ORPHAN_RATE:.0%} orphan rate -> {config.COOLDOWN_MINUTES}min pause")
+    print(f"  Snapshot cache:  {config.SNAPSHOT_CACHE_SIZE} ({config.SNAPSHOT_CACHE_SIZE * config.POLL_INTERVAL}s history)")
+    print(f"  Fee rate:        {config.FEE_RATE:.0%}")
+    print(f"  Soft arb prob:   {config.SOFT_ARB_PROB_THRESHOLD:.0%}")
     print(f"{'='*50}\n")
 
 

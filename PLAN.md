@@ -1,7 +1,7 @@
 # Kalshi Arb Bot — Build Plan
 
 ## Context
-Building a Kalshi arbitrage bot from scratch based on the fix plan PDF. The bot trades KXBTC15M (15-minute BTC binary markets) by detecting when Yes + No best asks sum to less than $1.00, then buying both sides to lock in the spread. The plan already identifies 4 bugs from a previous version — we'll build with those fixes baked in from the start.
+Arbitrage bot for Kalshi's KXBTC15M (15-minute BTC binary) markets. Detects when Yes + No best asks sum to less than $1.00, buys both sides to lock in the spread. Built with 4 original bug fixes baked in, then refactored with 5 execution improvements to minimize one-sided fill risk.
 
 ## Project Structure
 ```
@@ -12,38 +12,77 @@ C:\Users\ndste\kalshi-arb-bot\
 ├── requirements.txt      # requests, cryptography, python-dotenv
 ├── config.py             # All tunable settings
 ├── auth.py               # RSA-PSS signing + authenticated request helper
-├── kalshi_api.py          # API wrapper (markets, orderbook, orders, positions, balance)
+├── kalshi_api.py         # API wrapper (markets, orderbook, orders, positions, balance, sell)
 ├── bot.py                # Core arb bot logic
 ├── main.py               # Entry point
-└── PLAN.md               # Copy of this plan
+├── PROSPECTUS.md         # Strategy prospectus
+└── PLAN.md               # This file
 ```
 
-## Key Design Decisions
+## Original Fixes (v1)
 
-### 1. No duplicate trades (CRITICAL fix #1)
-- Maintain a `traded_tickers: set` — once a ticker is traded, it's blocked until removed
-- Clear tickers only when the market closes/settles (not on a timer)
-- On each scan loop, skip any ticker already in the set
+### 1. No duplicate trades (CRITICAL)
+- `traded_tickers: set` blocks re-trading a ticker until it settles
 
-### 2. Threshold at 95 cents (CRITICAL fix #2)
-- `ARB_THRESHOLD = 95` in config — only trade when combined best asks <= 95 cents
-- Ensures profit after Kalshi's ~7% taker fee on each leg
+### 2. Threshold at 95 cents (CRITICAL)
+- `ARB_THRESHOLD = 95` ensures profit after ~7% taker fee on each leg
 
-### 3. One-sided fill protection (HIGH fix #3)
-- After placing both legs, wait 5 seconds and check fill status
-- If one leg filled and the other hasn't, cancel the unfilled leg immediately
-- If the filled leg leaves us with unhedged exposure, log a warning (manual intervention)
-- Additional safety: 8-second hard cancel of any remaining open orders for that ticker
+### 3. One-sided fill protection (HIGH)
+- Replaced by v2 sequential execution (see below)
 
-### 4. Real deployed capital tracking (MEDIUM fix #4)
-- Query actual positions from `GET /portfolio/positions` to calculate real exposure
-- No fake local counter — always use live API data
-- Optional max exposure limit in config (default $50,000)
+### 4. Real deployed capital tracking (MEDIUM)
+- Live positions from API, no local counter, $50k max exposure cap
 
-## Verification
-1. Set `KALSHI_ENV=demo` in `.env` and run against sandbox
-2. Confirm markets are discovered and orderbooks are fetched
-3. Verify arb detection logs show correct combined prices
-4. Confirm no duplicate trades on the same ticker within a window
-5. Test one-sided fill protection by using a very aggressive price on one side
-6. Switch to `KALSHI_ENV=prod` for live trading
+## Execution Refactor (v2) — Current Implementation
+
+### 1. Pre-flight liquidity check
+- Both sides must have >= `MIN_DEPTH` (30) contracts at best ask before placing any orders
+- Prevents entering markets too thin to reliably fill both legs
+
+### 2. Leg the illiquid side first
+- Compare depth on both sides, place the thinner side first
+- Wait up to `FIRST_LEG_TIMEOUT` (2s) for fill
+- If first leg doesn't fill → cancel and abort with zero exposure
+- If it fills → immediately place second leg
+
+### 3. Orphan fill recovery
+- If second leg fails to fill within `SECOND_LEG_TIMEOUT` (3s):
+  - Cancel unfilled second leg
+  - Sell filled first leg at best bid immediately
+  - Log ticker, side, fill price, exit price, realized P&L
+  - Never hold orphaned positions
+
+### 4. Circuit breaker
+- Rolling window of last `WINDOW_SIZE` (20) attempts
+- If orphan rate > `MAX_ORPHAN_RATE` (25%) → pause for `COOLDOWN_MINUTES` (10)
+- Prevents bleeding money in fast/thin conditions
+
+### 5. Structured logging
+- Every attempt logs: timestamp, ticker, prices, depths, which side first, fill status, orphan rate
+
+## Config Variables
+```python
+ARB_THRESHOLD = 95          # Max combined price in cents
+MAX_CONTRACTS = 25          # Contracts per leg
+POLL_INTERVAL = 5           # Seconds between scans
+SERIES = ["KXBTC15M"]      # Series to monitor
+MAX_EXPOSURE = 50000_00     # Max capital in cents ($50k)
+MIN_DEPTH = 30              # Min contracts at best ask
+FIRST_LEG_TIMEOUT = 2       # Seconds for illiquid leg fill
+SECOND_LEG_TIMEOUT = 3      # Seconds for second leg fill
+WINDOW_SIZE = 20            # Rolling window for orphan rate
+MAX_ORPHAN_RATE = 0.25      # Circuit breaker threshold
+COOLDOWN_MINUTES = 10       # Pause duration on trip
+```
+
+## Deployment
+- Hosted on Digital Ocean droplet
+- Repo: https://github.com/nstef18447/kalshi-arb-bot-.git
+- Run with `screen -S arb && python main.py`
+- Start with `KALSHI_ENV=demo`, switch to `prod` when validated
+
+## Next Steps
+- [ ] Set up Kalshi API key and PEM file
+- [ ] Deploy to DO droplet and test against demo API
+- [ ] Validate arb detection, depth checks, and orphan recovery in sandbox
+- [ ] Switch to prod

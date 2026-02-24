@@ -30,7 +30,7 @@ def get_orderbook(ticker: str, depth: int = 1) -> dict:
     Returns dict with 'yes' and 'no' keys, each containing list of [price, quantity] levels.
     """
     data = authenticated_request(
-        "GET", f"/trade-api/v2/orderbook/{ticker}", params={"depth": depth}
+        "GET", f"/trade-api/v2/markets/{ticker}/orderbook", params={"depth": depth}
     )
     return data.get("orderbook", {})
 
