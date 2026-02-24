@@ -5,7 +5,8 @@ import sqlite3
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "arb_bot.db")
 
-SCHEMA = """
+# Tables only — indexes created after migrations
+SCHEMA_TABLES = """
 CREATE TABLE IF NOT EXISTS scans (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp REAL NOT NULL,
@@ -66,19 +67,22 @@ CREATE TABLE IF NOT EXISTS trades (
     realized_pnl REAL,
     fees REAL
 );
+"""
 
+# Indexes — created after migrations so columns exist
+SCHEMA_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_scans_ts ON scans(timestamp);
 CREATE INDEX IF NOT EXISTS idx_scans_expiry ON scans(expiry_window);
+CREATE INDEX IF NOT EXISTS idx_scans_series ON scans(series_ticker);
 CREATE INDEX IF NOT EXISTS idx_ladder_ts ON ladder_snapshots(timestamp);
 CREATE INDEX IF NOT EXISTS idx_ladder_expiry ON ladder_snapshots(expiry_window);
 CREATE INDEX IF NOT EXISTS idx_ladder_expiry_ts ON ladder_snapshots(expiry_window, timestamp);
+CREATE INDEX IF NOT EXISTS idx_ladder_series ON ladder_snapshots(series_ticker);
 CREATE INDEX IF NOT EXISTS idx_opps_ts ON opportunities(timestamp);
 CREATE INDEX IF NOT EXISTS idx_opps_type ON opportunities(opp_type, sub_type);
 CREATE INDEX IF NOT EXISTS idx_opps_expiry ON opportunities(expiry_window);
-CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(timestamp);
-CREATE INDEX IF NOT EXISTS idx_scans_series ON scans(series_ticker);
-CREATE INDEX IF NOT EXISTS idx_ladder_series ON ladder_snapshots(series_ticker);
 CREATE INDEX IF NOT EXISTS idx_opps_series ON opportunities(series_ticker);
+CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(timestamp);
 """
 
 
@@ -96,22 +100,31 @@ def get_connection(readonly=False):
 
 
 def init_db():
-    """Create all tables and indexes if they don't exist."""
+    """Create all tables, run migrations, then create indexes."""
     conn = get_connection()
     try:
-        conn.executescript(SCHEMA)
-        # Migrations for existing DBs
+        # 1. Create tables (IF NOT EXISTS — safe for existing DBs)
+        conn.executescript(SCHEMA_TABLES)
+
+        # 2. Migrations for existing DBs — add missing columns
         opp_cols = {row[1] for row in conn.execute("PRAGMA table_info(opportunities)").fetchall()}
         if "estimated_profit_maker" not in opp_cols:
             conn.execute("ALTER TABLE opportunities ADD COLUMN estimated_profit_maker REAL")
         if "series_ticker" not in opp_cols:
             conn.execute("ALTER TABLE opportunities ADD COLUMN series_ticker TEXT NOT NULL DEFAULT 'KXBTC'")
+
         scan_cols = {row[1] for row in conn.execute("PRAGMA table_info(scans)").fetchall()}
         if "series_ticker" not in scan_cols:
             conn.execute("ALTER TABLE scans ADD COLUMN series_ticker TEXT NOT NULL DEFAULT 'KXBTC'")
+
         snap_cols = {row[1] for row in conn.execute("PRAGMA table_info(ladder_snapshots)").fetchall()}
         if "series_ticker" not in snap_cols:
             conn.execute("ALTER TABLE ladder_snapshots ADD COLUMN series_ticker TEXT NOT NULL DEFAULT 'KXBTC'")
+
+        conn.commit()
+
+        # 3. Create indexes (columns now guaranteed to exist)
+        conn.executescript(SCHEMA_INDEXES)
         conn.commit()
     finally:
         conn.close()
