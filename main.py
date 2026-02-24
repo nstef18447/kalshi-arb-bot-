@@ -5,6 +5,7 @@ import logging
 from dotenv import load_dotenv
 
 import config
+import db_logger
 from bot import ArbBot
 from kalshi_api import get_balance
 
@@ -56,6 +57,14 @@ def main():
     setup_logging()
     validate_env()
     print_config()
+
+    # Initialize analytics database
+    try:
+        db_logger.init_db()
+        print("  Database initialized (arb_bot.db)")
+    except Exception as e:
+        print(f"  WARNING: Could not initialize database: {e}")
+        print("  Bot will run but dashboard data won't be collected.")
 
     try:
         balance = get_balance()

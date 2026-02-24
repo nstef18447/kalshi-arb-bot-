@@ -1,26 +1,79 @@
+import logging
+
 from auth import authenticated_request
+
+logger = logging.getLogger("arb-bot")
+
+
+def _paginate(path: str, params: dict, items_key: str) -> list[dict]:
+    """Paginate through all results for a given endpoint."""
+    all_items = []
+    cursor = None
+    while True:
+        p = dict(params)
+        if cursor:
+            p["cursor"] = cursor
+        data = authenticated_request("GET", path, params=p)
+        items = data.get(items_key, [])
+        all_items.extend(items)
+        cursor = data.get("cursor")
+        if not cursor or not items:
+            break
+    return all_items
+
+
+def get_events(series_ticker: str, status: str = "open") -> list[dict]:
+    """Fetch all events (expiry windows) for a series."""
+    return _paginate(
+        "/trade-api/v2/events",
+        {"series_ticker": series_ticker, "status": status, "limit": 200},
+        "events",
+    )
+
+
+def get_markets_for_event(event_ticker: str, status: str = "open") -> list[dict]:
+    """Fetch all markets (strikes) for a specific event."""
+    return _paginate(
+        "/trade-api/v2/markets",
+        {"event_ticker": event_ticker, "status": status, "limit": 200},
+        "markets",
+    )
 
 
 def get_markets(series_ticker: str, status: str = "open") -> list[dict]:
-    """Fetch all markets for a series with given status."""
-    markets = []
-    cursor = None
+    """Fetch ALL markets across ALL active expiry windows for a series.
 
-    while True:
-        params = {
-            "series_ticker": series_ticker,
-            "status": status,
-            "limit": 200,
-        }
-        if cursor:
-            params["cursor"] = cursor
+    Uses the events API first to discover all active windows, then fetches
+    markets per event. Falls back to direct series_ticker query if events
+    endpoint returns nothing.
+    """
+    # Primary approach: events -> markets per event
+    events = get_events(series_ticker, status)
+    if events:
+        all_markets = []
+        for ev in events:
+            event_ticker = ev.get("event_ticker", "")
+            if not event_ticker:
+                continue
+            markets = get_markets_for_event(event_ticker, status)
+            all_markets.extend(markets)
+        if all_markets:
+            logger.debug(
+                "Fetched %d markets across %d events for %s",
+                len(all_markets), len(events), series_ticker,
+            )
+            return all_markets
 
-        data = authenticated_request("GET", "/trade-api/v2/markets", params=params)
-        markets.extend(data.get("markets", []))
-        cursor = data.get("cursor")
-        if not cursor:
-            break
-
+    # Fallback: direct series_ticker on markets endpoint
+    markets = _paginate(
+        "/trade-api/v2/markets",
+        {"series_ticker": series_ticker, "status": status, "limit": 200},
+        "markets",
+    )
+    logger.debug(
+        "Fallback: fetched %d markets via series_ticker=%s",
+        len(markets), series_ticker,
+    )
     return markets
 
 

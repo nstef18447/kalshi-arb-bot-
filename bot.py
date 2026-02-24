@@ -5,10 +5,39 @@ from collections import deque
 from datetime import datetime, timezone
 
 import config
+import db_logger
 import kalshi_api
 from scanner import build_ladder, detect_violations, rank_opportunities, log_ladder
 
 logger = logging.getLogger("arb-bot")
+
+
+def _parse_expiry_timestamp(expiry_str: str) -> float:
+    """Parse ISO expiry string to unix timestamp. Returns 0 on failure."""
+    try:
+        # Handle formats like "2026-02-23T12:15:00Z"
+        dt = datetime.fromisoformat(expiry_str.replace("Z", "+00:00"))
+        return dt.timestamp()
+    except Exception:
+        return 0.0
+
+
+def _split_opp_type(type_str: str) -> tuple[str, str]:
+    """Split TradeOpportunity.type into (opp_type, sub_type) for the DB.
+
+    'A_monotonicity'    -> ('A', 'monotonicity')
+    'B_probability_gap' -> ('B', 'probability_gap')
+    'C_hard_arb'        -> ('C', 'hard')
+    'C_soft_arb'        -> ('C', 'soft')
+    """
+    if type_str == "C_hard_arb":
+        return "C", "hard"
+    if type_str == "C_soft_arb":
+        return "C", "soft"
+    parts = type_str.split("_", 1)
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    return type_str, ""
 
 
 def _is_filled(order: dict) -> bool:
@@ -77,8 +106,10 @@ class ArbBot:
                 logger.warning("Max exposure reached, skipping scan")
                 return
 
-            # Build ladder snapshots for all expiry windows
+            # Build ladder snapshots for all expiry windows (timed)
+            scan_start = time.monotonic()
             ladders = build_ladder(markets)
+            scan_duration_ms = (time.monotonic() - scan_start) * 1000
 
             # Cache + log + detect for each window
             for expiry, snapshot in ladders.items():
@@ -88,6 +119,59 @@ class ArbBot:
                 )
                 ranked = rank_opportunities(opportunities)
                 log_ladder(snapshot, ranked)
+
+                # ── DB logging: scan, snapshot, opportunities ──
+                now_ts = time.time()
+                expiry_ts = _parse_expiry_timestamp(expiry)
+                ttl = max(0.0, expiry_ts - now_ts) if expiry_ts > 0 else None
+
+                try:
+                    db_logger.log_scan(expiry, len(snapshot.strikes), scan_duration_ms)
+                except Exception:
+                    logger.warning("db_logger.log_scan failed", exc_info=True)
+
+                try:
+                    db_logger.log_snapshot(expiry, snapshot.strikes)
+                except Exception:
+                    logger.warning("db_logger.log_snapshot failed", exc_info=True)
+
+                # Build strike lookup for depth info
+                strike_map = {s.strike: s for s in snapshot.strikes}
+
+                for opp in ranked:
+                    try:
+                        opp_type, sub_type = _split_opp_type(opp.type)
+                        strike_low = opp.strikes[0]
+                        strike_high = opp.strikes[1] if len(opp.strikes) > 1 else opp.strikes[0]
+
+                        # Resolve prices from legs
+                        yes_ask_low = opp.legs[0]["price"] if opp.legs else 0
+                        no_ask_high = opp.legs[1]["price"] if len(opp.legs) > 1 else 0
+                        combined_cost = yes_ask_low + no_ask_high
+
+                        # Depth of the thinner side
+                        lo_strike = strike_map.get(strike_low)
+                        hi_strike = strike_map.get(strike_high)
+                        depth_thin = None
+                        if lo_strike and hi_strike:
+                            depth_thin = min(lo_strike.yes_ask_depth, hi_strike.no_ask_depth)
+
+                        db_logger.log_opportunity(
+                            expiry_window=expiry,
+                            opp_type=opp_type,
+                            sub_type=sub_type,
+                            strike_low=strike_low,
+                            strike_high=strike_high,
+                            yes_ask_low=yes_ask_low,
+                            no_ask_high=no_ask_high,
+                            combined_cost=combined_cost,
+                            estimated_profit=opp.net_profit_cents,
+                            btc_price_at_detection=None,
+                            time_to_expiry_seconds=ttl,
+                            depth_thin_side=depth_thin,
+                        )
+                    except Exception:
+                        logger.warning("db_logger.log_opportunity failed", exc_info=True)
 
                 # Still run existing single-market arb on each strike
                 for strike in snapshot.strikes:
@@ -99,6 +183,8 @@ class ArbBot:
                             strike.ticker, strike.yes_ask,
                             strike.yes_ask_depth, strike.no_ask,
                             strike.no_ask_depth,
+                            expiry_window=expiry,
+                            strike_price=strike.strike,
                         )
 
     def _cache_snapshot(self, expiry: str, snapshot):
@@ -112,9 +198,11 @@ class ArbBot:
     # ------------------------------------------------------------------
 
     def _execute_arb(self, ticker: str, yes_price: int, yes_depth: int,
-                     no_price: int, no_depth: int):
+                     no_price: int, no_depth: int,
+                     expiry_window: str = "", strike_price: float = 0.0):
         now = datetime.now(timezone.utc).strftime("%H:%M:%S")
         count = config.MAX_CONTRACTS
+        fee_per_leg = config.FEE_RATE * 100  # cents
 
         # --- 1. PRE-FLIGHT LIQUIDITY CHECK ---
         if yes_depth < config.MIN_DEPTH:
@@ -169,6 +257,15 @@ class ArbBot:
                 "[%s] %s ABORT: first leg %s did not fill in %ds — cancelled, no exposure",
                 now, ticker, first_side, config.FIRST_LEG_TIMEOUT,
             )
+            try:
+                db_logger.log_trade(
+                    expiry_window=expiry_window, opp_type="single",
+                    strike_low=strike_price, strike_high=strike_price,
+                    leg1_side=first_side, leg1_price=first_price,
+                    leg1_fill_status="cancelled",
+                )
+            except Exception:
+                logger.warning("db_logger.log_trade failed", exc_info=True)
             return
 
         logger.info("[%s] %s FIRST LEG FILLED: %s@%d", now, ticker, first_side, first_price)
@@ -178,7 +275,8 @@ class ArbBot:
             second_order = kalshi_api.create_order(ticker, second_side, second_price, count)
         except Exception:
             logger.exception("[%s] %s FAIL: could not place second leg (%s)", now, ticker, second_side)
-            self._handle_orphan(ticker, first_side, first_price, count, now)
+            self._handle_orphan(ticker, first_side, first_price, count, now,
+                                expiry_window, strike_price)
             return
 
         second_id = second_order.get("order_id", "")
@@ -197,6 +295,20 @@ class ArbBot:
                 now, ticker, profit, self._orphan_rate(),
                 self._orphan_count(), len(self.results),
             )
+            try:
+                db_logger.log_trade(
+                    expiry_window=expiry_window, opp_type="single",
+                    strike_low=strike_price, strike_high=strike_price,
+                    leg1_side=first_side, leg1_price=first_price,
+                    leg1_fill_status="filled",
+                    leg2_side=second_side, leg2_price=second_price,
+                    leg2_fill_status="filled",
+                    orphaned=False,
+                    realized_pnl=float(profit * count),
+                    fees=fee_per_leg * 2,
+                )
+            except Exception:
+                logger.warning("db_logger.log_trade failed", exc_info=True)
             return
 
         # --- 3. ORPHAN FILL RECOVERY: second leg didn't fill ---
@@ -205,16 +317,19 @@ class ArbBot:
             now, ticker, first_side, second_side, config.SECOND_LEG_TIMEOUT,
         )
         self._safe_cancel(second_id)
-        self._handle_orphan(ticker, first_side, first_price, count, now)
+        self._handle_orphan(ticker, first_side, first_price, count, now,
+                            expiry_window, strike_price)
 
     # ------------------------------------------------------------------
     # Orphan recovery — exit the filled leg immediately
     # ------------------------------------------------------------------
 
     def _handle_orphan(self, ticker: str, filled_side: str, fill_price: int,
-                       count: int, now: str):
+                       count: int, now: str,
+                       expiry_window: str = "", strike_price: float = 0.0):
         """Exit the orphaned position by selling at best bid."""
         self.results.append(False)
+        fee_per_leg = config.FEE_RATE * 100
 
         # Fetch current book to get best bid for our side
         try:
@@ -223,6 +338,16 @@ class ArbBot:
             logger.exception(
                 "[%s] %s ORPHAN EXIT FAILED: could not fetch orderbook for exit", now, ticker
             )
+            try:
+                db_logger.log_trade(
+                    expiry_window=expiry_window, opp_type="single",
+                    strike_low=strike_price, strike_high=strike_price,
+                    leg1_side=filled_side, leg1_price=fill_price,
+                    leg1_fill_status="filled",
+                    orphaned=True,
+                )
+            except Exception:
+                logger.warning("db_logger.log_trade failed", exc_info=True)
             self._check_circuit_breaker(now)
             return
 
@@ -255,6 +380,19 @@ class ArbBot:
                     realized_pnl, realized_pnl * count,
                     self._orphan_rate(), self._orphan_count(), len(self.results),
                 )
+                try:
+                    db_logger.log_trade(
+                        expiry_window=expiry_window, opp_type="single",
+                        strike_low=strike_price, strike_high=strike_price,
+                        leg1_side=filled_side, leg1_price=fill_price,
+                        leg1_fill_status="filled",
+                        orphaned=True,
+                        exit_price=exit_price,
+                        realized_pnl=float(realized_pnl * count),
+                        fees=fee_per_leg,
+                    )
+                except Exception:
+                    logger.warning("db_logger.log_trade failed", exc_info=True)
             else:
                 self._safe_cancel(sell_id)
                 logger.error(
@@ -262,12 +400,32 @@ class ArbBot:
                     "MANUAL INTERVENTION REQUIRED | holding %d %s@%d",
                     now, ticker, sell_id, count, filled_side, fill_price,
                 )
+                try:
+                    db_logger.log_trade(
+                        expiry_window=expiry_window, opp_type="single",
+                        strike_low=strike_price, strike_high=strike_price,
+                        leg1_side=filled_side, leg1_price=fill_price,
+                        leg1_fill_status="filled",
+                        orphaned=True,
+                    )
+                except Exception:
+                    logger.warning("db_logger.log_trade failed", exc_info=True)
         except Exception:
             logger.exception(
                 "[%s] %s ORPHAN EXIT FAILED: could not place sell order — "
                 "MANUAL INTERVENTION REQUIRED | holding %d %s@%d",
                 now, ticker, count, filled_side, fill_price,
             )
+            try:
+                db_logger.log_trade(
+                    expiry_window=expiry_window, opp_type="single",
+                    strike_low=strike_price, strike_high=strike_price,
+                    leg1_side=filled_side, leg1_price=fill_price,
+                    leg1_fill_status="filled",
+                    orphaned=True,
+                )
+            except Exception:
+                logger.warning("db_logger.log_trade failed", exc_info=True)
 
         self._check_circuit_breaker(now)
 
