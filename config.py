@@ -1,7 +1,7 @@
 ARB_THRESHOLD = 95          # Max combined price in cents to trigger arb
 MAX_CONTRACTS = 25          # Contracts per leg
 POLL_INTERVAL = 5           # Seconds between scan cycles
-SERIES = ["KXBTC15M"]      # Series tickers to monitor
+SERIES = ["KXBTC"]         # Series tickers to monitor (multi-strike BTC range markets)
 MAX_EXPOSURE = 50000_00     # Max deployed capital in cents ($50,000)
 
 # --- Execution tuning ---
