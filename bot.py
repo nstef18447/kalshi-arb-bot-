@@ -138,11 +138,12 @@ class ArbBot:
             # Cache + log + detect for each window
             for expiry, snapshot in ladders.items():
                 self._cache_snapshot(expiry, snapshot)
-                opportunities = detect_violations(
+                opportunities, stale_counts = detect_violations(
                     snapshot, taker_fee, config.SOFT_ARB_PROB_THRESHOLD
                 )
                 ranked = rank_opportunities(opportunities)
-                log_ladder(snapshot, ranked, series_ticker=series)
+                log_ladder(snapshot, ranked, series_ticker=series,
+                           stale_counts=stale_counts)
 
                 # ── DB logging: scan, snapshot, opportunities ──
                 now_ts = time.time()

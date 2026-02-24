@@ -111,28 +111,77 @@ def build_ladder(markets: list[dict]) -> dict[str, LadderSnapshot]:
 
 
 # ------------------------------------------------------------------
+# Stale quote filter
+# ------------------------------------------------------------------
+
+MIN_QUOTE_DEPTH = 10        # Ignore strikes with depth < 10 on either side
+MAX_COMBINED_SPREAD = 110   # Ignore strikes where yes_ask + no_ask > 110
+
+
+def _is_stale(strike: StrikeLevel) -> bool:
+    """True if this strike has phantom/stale quotes."""
+    if strike.yes_ask_depth < MIN_QUOTE_DEPTH or strike.no_ask_depth < MIN_QUOTE_DEPTH:
+        return True
+    if strike.yes_ask + strike.no_ask > MAX_COMBINED_SPREAD:
+        return True
+    return False
+
+
+# ------------------------------------------------------------------
 # Violation detectors
 # ------------------------------------------------------------------
 
 def detect_violations(snapshot: LadderSnapshot, fee_rate: float,
-                      prob_threshold: float) -> list[TradeOpportunity]:
-    """Run all detectors and return combined list."""
+                      prob_threshold: float) -> tuple[list[TradeOpportunity], dict]:
+    """Run all detectors. Returns (real_opps, stale_counts).
+
+    stale_counts: dict mapping type string to count of violations filtered
+    out because one or both strikes had stale/phantom quotes.
+    """
+    stale_counts: dict[str, int] = {}
+
+    def _split(raw: list[TradeOpportunity]) -> list[TradeOpportunity]:
+        """Keep real opps, count stale ones."""
+        real = []
+        for opp in raw:
+            real.append(opp)
+        return real
+
     opps = []
-    opps.extend(detect_type_a(snapshot))
-    opps.extend(detect_type_b(snapshot))
-    opps.extend(detect_type_c(snapshot, fee_rate, prob_threshold))
-    return opps
+    real_a, stale_a = detect_type_a(snapshot)
+    real_b, stale_b = detect_type_b(snapshot)
+    real_c, stale_c = detect_type_c(snapshot, fee_rate, prob_threshold)
+
+    opps.extend(real_a)
+    opps.extend(real_b)
+    opps.extend(real_c)
+
+    if stale_a:
+        stale_counts["A_monotonicity"] = stale_a
+    if stale_b:
+        stale_counts["B_probability_gap"] = stale_b
+    if stale_c:
+        stale_counts["C_arb"] = stale_c
+
+    return opps, stale_counts
 
 
-def detect_type_a(snapshot: LadderSnapshot) -> list[TradeOpportunity]:
-    """Monotonicity violations: Yes prices MUST decrease as strikes increase."""
+def detect_type_a(snapshot: LadderSnapshot) -> tuple[list[TradeOpportunity], int]:
+    """Monotonicity violations: Yes prices MUST decrease as strikes increase.
+
+    Returns (real_opps, stale_count).
+    """
     opps = []
+    stale = 0
     strikes = snapshot.strikes
     for i in range(len(strikes) - 1):
         lo = strikes[i]
         hi = strikes[i + 1]
         # If higher strike has a MORE expensive Yes ask, that's a violation
         if hi.yes_ask > lo.yes_ask:
+            if _is_stale(lo) or _is_stale(hi):
+                stale += 1
+                continue
             profit = hi.yes_ask - lo.yes_ask
             opps.append(TradeOpportunity(
                 type="A_monotonicity",
@@ -146,15 +195,19 @@ def detect_type_a(snapshot: LadderSnapshot) -> list[TradeOpportunity]:
                 net_profit_cents=float(profit),
                 confidence=1.0,
             ))
-    return opps
+    return opps, stale
 
 
-def detect_type_b(snapshot: LadderSnapshot) -> list[TradeOpportunity]:
-    """Probability gap: flag adjacent pairs with abnormal yes_ask drop rate."""
+def detect_type_b(snapshot: LadderSnapshot) -> tuple[list[TradeOpportunity], int]:
+    """Probability gap: flag adjacent pairs with abnormal yes_ask drop rate.
+
+    Returns (real_opps, stale_count).
+    """
     opps = []
+    stale = 0
     strikes = snapshot.strikes
     if len(strikes) < 3:
-        return opps
+        return opps, 0
 
     # Compute drop rate per dollar for each adjacent pair
     rates = []
@@ -169,11 +222,11 @@ def detect_type_b(snapshot: LadderSnapshot) -> list[TradeOpportunity]:
         rates.append((i, rate))
 
     if not rates:
-        return opps
+        return opps, 0
 
     avg_rate = sum(r for _, r in rates) / len(rates)
     if avg_rate == 0:
-        return opps
+        return opps, 0
 
     for idx, rate in rates:
         lo = strikes[idx]
@@ -181,6 +234,9 @@ def detect_type_b(snapshot: LadderSnapshot) -> list[TradeOpportunity]:
         ratio = rate / avg_rate if avg_rate != 0 else 0
 
         if ratio > 2.0 or ratio < 0.5:
+            if _is_stale(lo) or _is_stale(hi):
+                stale += 1
+                continue
             opps.append(TradeOpportunity(
                 type="B_probability_gap",
                 strikes=[lo.strike, hi.strike],
@@ -193,13 +249,17 @@ def detect_type_b(snapshot: LadderSnapshot) -> list[TradeOpportunity]:
                 net_profit_cents=0.0,
                 confidence=0.5,
             ))
-    return opps
+    return opps, stale
 
 
 def detect_type_c(snapshot: LadderSnapshot, fee_rate: float,
-                  prob_threshold: float) -> list[TradeOpportunity]:
-    """Synthetic arbs: buy Yes(low) + No(high) for guaranteed or probable profit."""
+                  prob_threshold: float) -> tuple[list[TradeOpportunity], int]:
+    """Synthetic arbs: buy Yes(low) + No(high) for guaranteed or probable profit.
+
+    Returns (real_opps, stale_count).
+    """
     opps = []
+    stale = 0
     strikes = snapshot.strikes
 
     for i in range(len(strikes)):
@@ -214,6 +274,9 @@ def detect_type_c(snapshot: LadderSnapshot, fee_rate: float,
 
             if cost < 100:
                 # HARD ARB — guaranteed profit
+                if _is_stale(lo) or _is_stale(hi):
+                    stale += 1
+                    continue
                 profit = 100 - cost
                 fee_total = fee_rate * 100 * 2  # fee on both legs' payout
                 net = profit - fee_total
@@ -236,6 +299,9 @@ def detect_type_c(snapshot: LadderSnapshot, fee_rate: float,
                     # Range probability estimate from implied prices
                     range_prob = lo.yes_ask / 100 - hi.yes_ask / 100
                     if range_prob > prob_threshold:
+                        if _is_stale(lo) or _is_stale(hi):
+                            stale += 1
+                            continue
                         profit = 100 - cost  # negative or zero for soft arb base
                         # Expected profit if BTC lands in range: extra $1 payout
                         expected_bonus = range_prob * 100
@@ -253,7 +319,7 @@ def detect_type_c(snapshot: LadderSnapshot, fee_rate: float,
                                 net_profit_cents=net,
                                 confidence=range_prob,
                             ))
-    return opps
+    return opps, stale
 
 
 # ------------------------------------------------------------------
@@ -274,7 +340,7 @@ def rank_opportunities(opps: list[TradeOpportunity]) -> list[TradeOpportunity]:
 
 
 def log_ladder(snapshot: LadderSnapshot, opportunities: list[TradeOpportunity],
-               series_ticker: str = ""):
+               series_ticker: str = "", stale_counts: dict | None = None):
     """Log compact ladder table and top opportunities."""
     # Extract short expiry label from expiry_time (last 4-5 chars typically HH:MM)
     expiry_short = snapshot.expiry_time[-8:-3] if len(snapshot.expiry_time) >= 8 else snapshot.expiry_time
@@ -286,18 +352,25 @@ def log_ladder(snapshot: LadderSnapshot, opportunities: list[TradeOpportunity],
         "strike", "y_ask", "y_bid", "n_ask", "n_bid", "depth_y", "depth_n",
     )
     for s in snapshot.strikes:
+        stale_tag = " *" if _is_stale(s) else ""
         logger.info(
-            "%-12.2f | %5d | %5d | %5d | %5d | %7d | %7d",
+            "%-12.2f | %5d | %5d | %5d | %5d | %7d | %7d%s",
             s.strike, s.yes_ask, s.yes_bid, s.no_ask, s.no_bid,
-            s.yes_ask_depth, s.no_ask_depth,
+            s.yes_ask_depth, s.no_ask_depth, stale_tag,
         )
 
     # Violation count by type
     type_counts: dict[str, int] = {}
     for o in opportunities:
         type_counts[o.type] = type_counts.get(o.type, 0) + 1
-    if type_counts:
-        parts = [f"{t}={c}" for t, c in sorted(type_counts.items())]
+    parts = [f"{t}={c}" for t, c in sorted(type_counts.items())]
+
+    # Stale violation counts
+    if stale_counts:
+        stale_parts = [f"stale_{t}={c}" for t, c in sorted(stale_counts.items())]
+        parts.extend(stale_parts)
+
+    if parts:
         logger.info("Violations: %s", ", ".join(parts))
     else:
         logger.info("No violations detected")
