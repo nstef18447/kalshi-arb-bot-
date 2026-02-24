@@ -273,12 +273,13 @@ def rank_opportunities(opps: list[TradeOpportunity]) -> list[TradeOpportunity]:
     return hard + soft + other
 
 
-def log_ladder(snapshot: LadderSnapshot, opportunities: list[TradeOpportunity]):
+def log_ladder(snapshot: LadderSnapshot, opportunities: list[TradeOpportunity],
+               series_ticker: str = ""):
     """Log compact ladder table and top opportunities."""
     # Extract short expiry label from expiry_time (last 4-5 chars typically HH:MM)
     expiry_short = snapshot.expiry_time[-8:-3] if len(snapshot.expiry_time) >= 8 else snapshot.expiry_time
 
-    header = f"KXBTC15M {expiry_short} | {len(snapshot.strikes)} strikes"
+    header = f"{series_ticker} {expiry_short} | {len(snapshot.strikes)} strikes"
     logger.info(header)
     logger.info(
         "%-12s | %5s | %5s | %5s | %5s | %7s | %7s",

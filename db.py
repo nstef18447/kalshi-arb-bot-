@@ -9,6 +9,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS scans (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp REAL NOT NULL,
+    series_ticker TEXT NOT NULL DEFAULT '',
     expiry_window TEXT NOT NULL,
     num_strikes INTEGER NOT NULL,
     scan_duration_ms REAL
@@ -17,6 +18,7 @@ CREATE TABLE IF NOT EXISTS scans (
 CREATE TABLE IF NOT EXISTS ladder_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp REAL NOT NULL,
+    series_ticker TEXT NOT NULL DEFAULT '',
     expiry_window TEXT NOT NULL,
     strike REAL NOT NULL,
     yes_ask INTEGER NOT NULL,
@@ -30,6 +32,7 @@ CREATE TABLE IF NOT EXISTS ladder_snapshots (
 CREATE TABLE IF NOT EXISTS opportunities (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp REAL NOT NULL,
+    series_ticker TEXT NOT NULL DEFAULT '',
     expiry_window TEXT NOT NULL,
     opp_type TEXT NOT NULL,
     sub_type TEXT NOT NULL,
@@ -73,6 +76,9 @@ CREATE INDEX IF NOT EXISTS idx_opps_ts ON opportunities(timestamp);
 CREATE INDEX IF NOT EXISTS idx_opps_type ON opportunities(opp_type, sub_type);
 CREATE INDEX IF NOT EXISTS idx_opps_expiry ON opportunities(expiry_window);
 CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(timestamp);
+CREATE INDEX IF NOT EXISTS idx_scans_series ON scans(series_ticker);
+CREATE INDEX IF NOT EXISTS idx_ladder_series ON ladder_snapshots(series_ticker);
+CREATE INDEX IF NOT EXISTS idx_opps_series ON opportunities(series_ticker);
 """
 
 
@@ -94,10 +100,18 @@ def init_db():
     conn = get_connection()
     try:
         conn.executescript(SCHEMA)
-        # Migrate: add estimated_profit_maker if missing (existing DBs)
-        cols = {row[1] for row in conn.execute("PRAGMA table_info(opportunities)").fetchall()}
-        if "estimated_profit_maker" not in cols:
+        # Migrations for existing DBs
+        opp_cols = {row[1] for row in conn.execute("PRAGMA table_info(opportunities)").fetchall()}
+        if "estimated_profit_maker" not in opp_cols:
             conn.execute("ALTER TABLE opportunities ADD COLUMN estimated_profit_maker REAL")
+        if "series_ticker" not in opp_cols:
+            conn.execute("ALTER TABLE opportunities ADD COLUMN series_ticker TEXT NOT NULL DEFAULT 'KXBTC'")
+        scan_cols = {row[1] for row in conn.execute("PRAGMA table_info(scans)").fetchall()}
+        if "series_ticker" not in scan_cols:
+            conn.execute("ALTER TABLE scans ADD COLUMN series_ticker TEXT NOT NULL DEFAULT 'KXBTC'")
+        snap_cols = {row[1] for row in conn.execute("PRAGMA table_info(ladder_snapshots)").fetchall()}
+        if "series_ticker" not in snap_cols:
+            conn.execute("ALTER TABLE ladder_snapshots ADD COLUMN series_ticker TEXT NOT NULL DEFAULT 'KXBTC'")
         conn.commit()
     finally:
         conn.close()

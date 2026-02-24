@@ -26,21 +26,21 @@ def get_table_counts():
         conn.close()
 
 
-def log_scan(expiry_window, num_strikes, scan_duration_ms=None):
+def log_scan(expiry_window, num_strikes, scan_duration_ms=None, series_ticker=""):
     """Log a completed scan cycle for one expiry window."""
     conn = db.get_connection()
     try:
         conn.execute(
-            "INSERT INTO scans (timestamp, expiry_window, num_strikes, scan_duration_ms) "
-            "VALUES (?, ?, ?, ?)",
-            (time.time(), expiry_window, num_strikes, scan_duration_ms),
+            "INSERT INTO scans (timestamp, series_ticker, expiry_window, num_strikes, scan_duration_ms) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (time.time(), series_ticker, expiry_window, num_strikes, scan_duration_ms),
         )
         conn.commit()
     finally:
         conn.close()
 
 
-def log_snapshot(expiry_window, strikes):
+def log_snapshot(expiry_window, strikes, series_ticker=""):
     """Log a full ladder snapshot — one row per strike.
 
     strikes: list of scanner.StrikeLevel (or dicts with same keys)
@@ -51,23 +51,21 @@ def log_snapshot(expiry_window, strikes):
         rows = []
         for s in strikes:
             if hasattr(s, "strike"):
-                # StrikeLevel dataclass
                 rows.append((
-                    now, expiry_window, s.strike,
+                    now, series_ticker, expiry_window, s.strike,
                     s.yes_ask, s.yes_bid, s.no_ask, s.no_bid,
                     s.yes_ask_depth, s.no_ask_depth,
                 ))
             else:
-                # dict fallback
                 rows.append((
-                    now, expiry_window, s["strike"],
+                    now, series_ticker, expiry_window, s["strike"],
                     s["yes_ask"], s["yes_bid"], s["no_ask"], s["no_bid"],
                     s["yes_ask_depth"], s["no_ask_depth"],
                 ))
         conn.executemany(
             "INSERT INTO ladder_snapshots "
-            "(timestamp, expiry_window, strike, yes_ask, yes_bid, no_ask, no_bid, yes_depth, no_depth) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "(timestamp, series_ticker, expiry_window, strike, yes_ask, yes_bid, no_ask, no_bid, yes_depth, no_depth) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             rows,
         )
         conn.commit()
@@ -77,7 +75,7 @@ def log_snapshot(expiry_window, strikes):
 
 def log_opportunity(expiry_window, opp_type, sub_type, strike_low, strike_high,
                     yes_ask_low, no_ask_high, combined_cost, estimated_profit,
-                    estimated_profit_maker=None,
+                    estimated_profit_maker=None, series_ticker="",
                     btc_price_at_detection=None, time_to_expiry_seconds=None,
                     depth_thin_side=None):
     """Log a detected arbitrage opportunity."""
@@ -85,12 +83,12 @@ def log_opportunity(expiry_window, opp_type, sub_type, strike_low, strike_high,
     try:
         conn.execute(
             "INSERT INTO opportunities "
-            "(timestamp, expiry_window, opp_type, sub_type, strike_low, strike_high, "
+            "(timestamp, series_ticker, expiry_window, opp_type, sub_type, strike_low, strike_high, "
             "yes_ask_low, no_ask_high, combined_cost, estimated_profit, "
             "estimated_profit_maker, "
             "btc_price_at_detection, time_to_expiry_seconds, depth_thin_side) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (time.time(), expiry_window, opp_type, sub_type, strike_low, strike_high,
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (time.time(), series_ticker, expiry_window, opp_type, sub_type, strike_low, strike_high,
              yes_ask_low, no_ask_high, combined_cost, estimated_profit,
              estimated_profit_maker,
              btc_price_at_detection, time_to_expiry_seconds, depth_thin_side),
@@ -103,14 +101,15 @@ def log_opportunity(expiry_window, opp_type, sub_type, strike_low, strike_high,
 def get_maker_summary(window_seconds=1800):
     """Return 30-minute summary of hard arb opportunities with maker fee analysis.
 
-    Returns dict with keys: total_hard_arbs, profitable_taker, profitable_maker,
+    Returns list of dicts (one per series + an 'ALL' aggregate), each with keys:
+    series, total_hard_arbs, profitable_taker, profitable_maker,
     avg_gross_spread_maker, avg_depth_maker. Returns None if no data.
     """
     conn = db.get_connection(readonly=True)
     try:
         cutoff = time.time() - window_seconds
         rows = conn.execute(
-            "SELECT combined_cost, estimated_profit, estimated_profit_maker, depth_thin_side "
+            "SELECT series_ticker, combined_cost, estimated_profit, estimated_profit_maker, depth_thin_side "
             "FROM opportunities "
             "WHERE opp_type = 'C' AND sub_type = 'hard' AND timestamp >= ?",
             (cutoff,),
@@ -119,27 +118,43 @@ def get_maker_summary(window_seconds=1800):
         if not rows:
             return None
 
-        total = len(rows)
-        profitable_taker = sum(1 for r in rows if r["estimated_profit"] > 0)
-        profitable_maker = sum(1 for r in rows if r["estimated_profit_maker"] is not None and r["estimated_profit_maker"] > 0)
+        def _summarize(subset):
+            total = len(subset)
+            profitable_taker = sum(1 for r in subset if r["estimated_profit"] > 0)
+            profitable_maker = sum(1 for r in subset if r["estimated_profit_maker"] is not None and r["estimated_profit_maker"] > 0)
+            maker_rows = [r for r in subset if r["estimated_profit_maker"] is not None and r["estimated_profit_maker"] > 0]
+            if maker_rows:
+                avg_spread = sum(100 - r["combined_cost"] for r in maker_rows) / len(maker_rows)
+                depths = [r["depth_thin_side"] for r in maker_rows if r["depth_thin_side"] is not None]
+                avg_depth = sum(depths) / len(depths) if depths else 0
+            else:
+                avg_spread = 0
+                avg_depth = 0
+            return {
+                "total_hard_arbs": total,
+                "profitable_taker": profitable_taker,
+                "profitable_maker": profitable_maker,
+                "avg_gross_spread_maker": avg_spread,
+                "avg_depth_maker": avg_depth,
+            }
 
-        # Stats for maker-profitable subset
-        maker_rows = [r for r in rows if r["estimated_profit_maker"] is not None and r["estimated_profit_maker"] > 0]
-        if maker_rows:
-            avg_spread = sum(100 - r["combined_cost"] for r in maker_rows) / len(maker_rows)
-            depths = [r["depth_thin_side"] for r in maker_rows if r["depth_thin_side"] is not None]
-            avg_depth = sum(depths) / len(depths) if depths else 0
-        else:
-            avg_spread = 0
-            avg_depth = 0
+        # Aggregate across all series
+        result = _summarize(rows)
+        result["series"] = "ALL"
 
-        return {
-            "total_hard_arbs": total,
-            "profitable_taker": profitable_taker,
-            "profitable_maker": profitable_maker,
-            "avg_gross_spread_maker": avg_spread,
-            "avg_depth_maker": avg_depth,
-        }
+        # Per-series breakdown
+        by_series = {}
+        for r in rows:
+            s = r["series_ticker"] or "UNKNOWN"
+            by_series.setdefault(s, []).append(r)
+
+        per_series = []
+        for s, subset in sorted(by_series.items()):
+            d = _summarize(subset)
+            d["series"] = s
+            per_series.append(d)
+
+        return {"all": result, "per_series": per_series}
     finally:
         conn.close()
 

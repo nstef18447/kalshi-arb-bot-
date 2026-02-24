@@ -37,7 +37,9 @@ def print_config():
     print(f"\n{'='*50}")
     print(f"  Kalshi Arb Bot — {env} MODE")
     print(f"{'='*50}")
-    print(f"  Series:          {config.SERIES}")
+    print(f"  Series:          {list(config.SERIES.keys())}")
+    for ticker, fees in config.SERIES.items():
+        print(f"    {ticker:12s} taker={fees['taker_fee']:.1%}  maker_mult={fees['maker_mult']}")
     print(f"  Arb threshold:   {config.ARB_THRESHOLD} cents")
     print(f"  Contracts/leg:   {config.MAX_CONTRACTS}")
     print(f"  Poll interval:   {config.POLL_INTERVAL}s")
@@ -47,7 +49,6 @@ def print_config():
     print(f"  2nd leg timeout: {config.SECOND_LEG_TIMEOUT}s")
     print(f"  Circuit breaker: {config.MAX_ORPHAN_RATE:.0%} orphan rate -> {config.COOLDOWN_MINUTES}min pause")
     print(f"  Snapshot cache:  {config.SNAPSHOT_CACHE_SIZE} ({config.SNAPSHOT_CACHE_SIZE * config.POLL_INTERVAL}s history)")
-    print(f"  Fee rate:        {config.FEE_RATE:.0%}")
     print(f"  Soft arb prob:   {config.SOFT_ARB_PROB_THRESHOLD:.0%}")
     if config.READ_ONLY:
         print(f"\n  MODE: READ-ONLY (scan only, no trading)")

@@ -55,20 +55,20 @@ def _wait_for_fill(order_id: str, timeout: float) -> dict:
     return kalshi_api.get_order(order_id)
 
 
-def _maker_fee(price_cents: int) -> float:
-    """Kalshi maker fee: 0.0175 * P * (1-P), where P = price/100.
+def _maker_fee(price_cents: int, maker_mult: float = 0.0175) -> float:
+    """Kalshi maker fee: mult * P * (1-P), where P = price/100.
 
     Returns fee in cents for one contract on one leg.
     """
     p = price_cents / 100.0
-    return 0.0175 * p * (1.0 - p) * 100.0  # convert back to cents
+    return maker_mult * p * (1.0 - p) * 100.0  # convert back to cents
 
 
-def _maker_profit(yes_ask: int, no_ask: int) -> float:
+def _maker_profit(yes_ask: int, no_ask: int, maker_mult: float = 0.0175) -> float:
     """Net profit in cents per contract using maker fees on both legs."""
     gross = 100 - yes_ask - no_ask
-    fee_leg1 = _maker_fee(yes_ask)
-    fee_leg2 = _maker_fee(no_ask)
+    fee_leg1 = _maker_fee(yes_ask, maker_mult)
+    fee_leg2 = _maker_fee(no_ask, maker_mult)
     return gross - fee_leg1 - fee_leg2
 
 
@@ -85,7 +85,7 @@ class ArbBot:
 
     def start(self):
         self.running = True
-        logger.info("Bot started — scanning %s series", config.SERIES)
+        logger.info("Bot started — scanning %s series", list(config.SERIES.keys()))
         while self.running:
             try:
                 if time.monotonic() < self.paused_until:
@@ -109,9 +109,15 @@ class ArbBot:
     # ------------------------------------------------------------------
 
     def _scan_cycle(self):
-        for series in config.SERIES:
+        for series, fee_cfg in config.SERIES.items():
+            taker_fee = fee_cfg["taker_fee"]
+            maker_mult = fee_cfg["maker_mult"]
+
             markets = kalshi_api.get_markets(series, status="open")
             logger.info("Found %d open markets for %s", len(markets), series)
+
+            if not markets:
+                continue
 
             # Housekeeping: clear traded tickers for markets that are no longer open
             open_tickers = {m["ticker"] for m in markets}
@@ -133,10 +139,10 @@ class ArbBot:
             for expiry, snapshot in ladders.items():
                 self._cache_snapshot(expiry, snapshot)
                 opportunities = detect_violations(
-                    snapshot, config.FEE_RATE, config.SOFT_ARB_PROB_THRESHOLD
+                    snapshot, taker_fee, config.SOFT_ARB_PROB_THRESHOLD
                 )
                 ranked = rank_opportunities(opportunities)
-                log_ladder(snapshot, ranked)
+                log_ladder(snapshot, ranked, series_ticker=series)
 
                 # ── DB logging: scan, snapshot, opportunities ──
                 now_ts = time.time()
@@ -144,12 +150,13 @@ class ArbBot:
                 ttl = max(0.0, expiry_ts - now_ts) if expiry_ts > 0 else None
 
                 try:
-                    db_logger.log_scan(expiry, len(snapshot.strikes), scan_duration_ms)
+                    db_logger.log_scan(expiry, len(snapshot.strikes), scan_duration_ms,
+                                       series_ticker=series)
                 except Exception:
                     logger.warning("db_logger.log_scan failed", exc_info=True)
 
                 try:
-                    db_logger.log_snapshot(expiry, snapshot.strikes)
+                    db_logger.log_snapshot(expiry, snapshot.strikes, series_ticker=series)
                 except Exception:
                     logger.warning("db_logger.log_snapshot failed", exc_info=True)
 
@@ -174,8 +181,8 @@ class ArbBot:
                         if lo_strike and hi_strike:
                             depth_thin = min(lo_strike.yes_ask_depth, hi_strike.no_ask_depth)
 
-                        # Maker profit: use maker fee formula on each leg
-                        maker_profit = _maker_profit(yes_ask_low, no_ask_high)
+                        # Maker profit: use series-specific maker multiplier
+                        maker_profit = _maker_profit(yes_ask_low, no_ask_high, maker_mult)
 
                         db_logger.log_opportunity(
                             expiry_window=expiry,
@@ -188,32 +195,13 @@ class ArbBot:
                             combined_cost=combined_cost,
                             estimated_profit=opp.net_profit_cents,
                             estimated_profit_maker=maker_profit,
+                            series_ticker=series,
                             btc_price_at_detection=None,
                             time_to_expiry_seconds=ttl,
                             depth_thin_side=depth_thin,
                         )
                     except Exception:
                         logger.warning("db_logger.log_opportunity failed", exc_info=True)
-
-                # --- 30-minute maker strategy summary ---
-                now_mono = time.monotonic()
-                if now_mono - self.last_summary_time >= 1800:
-                    self.last_summary_time = now_mono
-                    try:
-                        summary = db_logger.get_maker_summary(window_seconds=1800)
-                        if summary:
-                            logger.info(
-                                "=== 30-MIN MAKER SUMMARY === "
-                                "hard_arbs=%d | profitable_taker=%d | profitable_maker=%d | "
-                                "avg_gross_spread=%.1f cents | avg_depth_thin=%d contracts",
-                                summary["total_hard_arbs"],
-                                summary["profitable_taker"],
-                                summary["profitable_maker"],
-                                summary["avg_gross_spread_maker"],
-                                int(summary["avg_depth_maker"]),
-                            )
-                    except Exception:
-                        logger.warning("Maker summary query failed", exc_info=True)
 
                 # Execute single-market arb on each strike (scan-only in READ_ONLY)
                 for strike in snapshot.strikes:
@@ -234,6 +222,35 @@ class ArbBot:
                                 expiry_window=expiry,
                                 strike_price=strike.strike,
                             )
+
+        # --- 30-minute maker strategy summary (once per cycle, after all series) ---
+        now_mono = time.monotonic()
+        if now_mono - self.last_summary_time >= 1800:
+            self.last_summary_time = now_mono
+            try:
+                result = db_logger.get_maker_summary(window_seconds=1800)
+                if result:
+                    agg = result["all"]
+                    logger.info(
+                        "=== 30-MIN MAKER SUMMARY (ALL) === "
+                        "hard_arbs=%d | profitable_taker=%d | profitable_maker=%d | "
+                        "avg_gross_spread=%.1f cents | avg_depth_thin=%d contracts",
+                        agg["total_hard_arbs"],
+                        agg["profitable_taker"],
+                        agg["profitable_maker"],
+                        agg["avg_gross_spread_maker"],
+                        int(agg["avg_depth_maker"]),
+                    )
+                    for s in result["per_series"]:
+                        logger.info(
+                            "  %s: hard_arbs=%d | taker_profit=%d | maker_profit=%d | "
+                            "avg_spread=%.1f | avg_depth=%d",
+                            s["series"], s["total_hard_arbs"],
+                            s["profitable_taker"], s["profitable_maker"],
+                            s["avg_gross_spread_maker"], int(s["avg_depth_maker"]),
+                        )
+            except Exception:
+                logger.warning("Maker summary query failed", exc_info=True)
 
     def _cache_snapshot(self, expiry: str, snapshot):
         """Store snapshot in rolling cache for trend analysis."""
