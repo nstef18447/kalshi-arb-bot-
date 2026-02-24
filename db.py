@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS opportunities (
     no_ask_high INTEGER NOT NULL,
     combined_cost INTEGER NOT NULL,
     estimated_profit REAL NOT NULL,
+    estimated_profit_maker REAL,
     btc_price_at_detection REAL,
     time_to_expiry_seconds REAL,
     depth_thin_side INTEGER
@@ -93,6 +94,10 @@ def init_db():
     conn = get_connection()
     try:
         conn.executescript(SCHEMA)
+        # Migrate: add estimated_profit_maker if missing (existing DBs)
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(opportunities)").fetchall()}
+        if "estimated_profit_maker" not in cols:
+            conn.execute("ALTER TABLE opportunities ADD COLUMN estimated_profit_maker REAL")
         conn.commit()
     finally:
         conn.close()

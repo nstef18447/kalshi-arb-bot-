@@ -77,6 +77,7 @@ def log_snapshot(expiry_window, strikes):
 
 def log_opportunity(expiry_window, opp_type, sub_type, strike_low, strike_high,
                     yes_ask_low, no_ask_high, combined_cost, estimated_profit,
+                    estimated_profit_maker=None,
                     btc_price_at_detection=None, time_to_expiry_seconds=None,
                     depth_thin_side=None):
     """Log a detected arbitrage opportunity."""
@@ -86,13 +87,59 @@ def log_opportunity(expiry_window, opp_type, sub_type, strike_low, strike_high,
             "INSERT INTO opportunities "
             "(timestamp, expiry_window, opp_type, sub_type, strike_low, strike_high, "
             "yes_ask_low, no_ask_high, combined_cost, estimated_profit, "
+            "estimated_profit_maker, "
             "btc_price_at_detection, time_to_expiry_seconds, depth_thin_side) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (time.time(), expiry_window, opp_type, sub_type, strike_low, strike_high,
              yes_ask_low, no_ask_high, combined_cost, estimated_profit,
+             estimated_profit_maker,
              btc_price_at_detection, time_to_expiry_seconds, depth_thin_side),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def get_maker_summary(window_seconds=1800):
+    """Return 30-minute summary of hard arb opportunities with maker fee analysis.
+
+    Returns dict with keys: total_hard_arbs, profitable_taker, profitable_maker,
+    avg_gross_spread_maker, avg_depth_maker. Returns None if no data.
+    """
+    conn = db.get_connection(readonly=True)
+    try:
+        cutoff = time.time() - window_seconds
+        rows = conn.execute(
+            "SELECT combined_cost, estimated_profit, estimated_profit_maker, depth_thin_side "
+            "FROM opportunities "
+            "WHERE opp_type = 'C' AND sub_type = 'hard' AND timestamp >= ?",
+            (cutoff,),
+        ).fetchall()
+
+        if not rows:
+            return None
+
+        total = len(rows)
+        profitable_taker = sum(1 for r in rows if r["estimated_profit"] > 0)
+        profitable_maker = sum(1 for r in rows if r["estimated_profit_maker"] is not None and r["estimated_profit_maker"] > 0)
+
+        # Stats for maker-profitable subset
+        maker_rows = [r for r in rows if r["estimated_profit_maker"] is not None and r["estimated_profit_maker"] > 0]
+        if maker_rows:
+            avg_spread = sum(100 - r["combined_cost"] for r in maker_rows) / len(maker_rows)
+            depths = [r["depth_thin_side"] for r in maker_rows if r["depth_thin_side"] is not None]
+            avg_depth = sum(depths) / len(depths) if depths else 0
+        else:
+            avg_spread = 0
+            avg_depth = 0
+
+        return {
+            "total_hard_arbs": total,
+            "profitable_taker": profitable_taker,
+            "profitable_maker": profitable_maker,
+            "avg_gross_spread_maker": avg_spread,
+            "avg_depth_maker": avg_depth,
+        }
     finally:
         conn.close()
 
