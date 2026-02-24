@@ -118,6 +118,12 @@ MIN_QUOTE_DEPTH = 10        # Ignore strikes with depth < 10 on either side
 MAX_COMBINED_SPREAD = 110   # Ignore strikes where yes_ask + no_ask > 110
 
 
+def _parabolic_fee(price_cents: int, multiplier: float) -> float:
+    """Kalshi fee: multiplier * P * (1-P), in cents per contract."""
+    p = price_cents / 100.0
+    return multiplier * p * (1.0 - p) * 100.0
+
+
 def _is_stale(strike: StrikeLevel) -> bool:
     """True if this strike has phantom/stale quotes."""
     if strike.yes_ask_depth < MIN_QUOTE_DEPTH or strike.no_ask_depth < MIN_QUOTE_DEPTH:
@@ -278,7 +284,7 @@ def detect_type_c(snapshot: LadderSnapshot, fee_rate: float,
                     stale += 1
                     continue
                 profit = 100 - cost
-                fee_total = fee_rate * 100 * 2  # fee on both legs' payout
+                fee_total = _parabolic_fee(lo.yes_ask, fee_rate) + _parabolic_fee(hi.no_ask, fee_rate)
                 net = profit - fee_total
                 opps.append(TradeOpportunity(
                     type="C_hard_arb",
@@ -294,7 +300,7 @@ def detect_type_c(snapshot: LadderSnapshot, fee_rate: float,
                 ))
             else:
                 # Check for soft arb: cost < 100 + fees and range probability > threshold
-                fee_total = fee_rate * 100 * 2
+                fee_total = _parabolic_fee(lo.yes_ask, fee_rate) + _parabolic_fee(hi.no_ask, fee_rate)
                 if cost < 100 + fee_total:
                     # Range probability estimate from implied prices
                     range_prob = lo.yes_ask / 100 - hi.yes_ask / 100
