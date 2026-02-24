@@ -12,7 +12,9 @@ MAX_EXPOSURE = 50000_00     # Max deployed capital in cents ($50,000)
 # taker_fee: flat rate applied to payout (e.g. 0.07 = 7%)
 # maker_mult: multiplier in maker fee formula: mult * P * (1-P)
 SERIES = {
-    "KXBTC":     {"taker_fee": 0.07,  "maker_mult": 0.0175},
+    "KXBTC":        {"taker_fee": 0.07,  "maker_mult": 0.0175},
+    "KXETH":        {"taker_fee": 0.07,  "maker_mult": 0.0175},
+    "KXSOL":        {"taker_fee": 0.07,  "maker_mult": 0.0175},
     "KXINXU":       {"taker_fee": 0.035, "maker_mult": 0.00875},
     "KXNASDAQ100U": {"taker_fee": 0.035, "maker_mult": 0.00875},
 }
