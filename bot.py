@@ -102,7 +102,7 @@ class ArbBot:
                 logger.info("Clearing settled tickers: %s", settled)
                 self.traded_tickers -= settled
 
-            if not self._check_exposure():
+            if not config.READ_ONLY and not self._check_exposure():
                 logger.warning("Max exposure reached, skipping scan")
                 return
 
@@ -173,19 +173,25 @@ class ArbBot:
                     except Exception:
                         logger.warning("db_logger.log_opportunity failed", exc_info=True)
 
-                # Still run existing single-market arb on each strike
+                # Execute single-market arb on each strike (scan-only in READ_ONLY)
                 for strike in snapshot.strikes:
                     if strike.ticker in self.traded_tickers:
                         continue
                     combined = strike.yes_ask + strike.no_ask
                     if combined <= config.ARB_THRESHOLD:
-                        self._execute_arb(
-                            strike.ticker, strike.yes_ask,
-                            strike.yes_ask_depth, strike.no_ask,
-                            strike.no_ask_depth,
-                            expiry_window=expiry,
-                            strike_price=strike.strike,
-                        )
+                        if config.READ_ONLY:
+                            logger.info(
+                                "READ_ONLY: would execute arb on %s — yes=%d + no=%d = %d",
+                                strike.ticker, strike.yes_ask, strike.no_ask, combined,
+                            )
+                        else:
+                            self._execute_arb(
+                                strike.ticker, strike.yes_ask,
+                                strike.yes_ask_depth, strike.no_ask,
+                                strike.no_ask_depth,
+                                expiry_window=expiry,
+                                strike_price=strike.strike,
+                            )
 
     def _cache_snapshot(self, expiry: str, snapshot):
         """Store snapshot in rolling cache for trend analysis."""

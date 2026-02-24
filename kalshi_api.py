@@ -1,5 +1,6 @@
 import logging
 
+import config
 from auth import authenticated_request
 
 logger = logging.getLogger("arb-bot")
@@ -89,17 +90,9 @@ def get_orderbook(ticker: str, depth: int = 1) -> dict:
 
 
 def create_order(ticker: str, side: str, price_cents: int, count: int) -> dict:
-    """Place a limit order.
-
-    Args:
-        ticker: Market ticker
-        side: 'yes' or 'no'
-        price_cents: Limit price in cents (1-99)
-        count: Number of contracts
-
-    Returns:
-        Order dict from API
-    """
+    """Place a limit order. Blocked when READ_ONLY is true."""
+    if config.READ_ONLY:
+        raise RuntimeError("create_order blocked: READ_ONLY mode is active")
     body = {
         "ticker": ticker,
         "action": "buy",
@@ -113,17 +106,9 @@ def create_order(ticker: str, side: str, price_cents: int, count: int) -> dict:
 
 
 def create_sell_order(ticker: str, side: str, price_cents: int, count: int) -> dict:
-    """Place a limit sell order (for orphan exit).
-
-    Args:
-        ticker: Market ticker
-        side: 'yes' or 'no' — the side we're selling
-        price_cents: Limit price in cents (aggressive = best bid)
-        count: Number of contracts
-
-    Returns:
-        Order dict from API
-    """
+    """Place a limit sell order. Blocked when READ_ONLY is true."""
+    if config.READ_ONLY:
+        raise RuntimeError("create_sell_order blocked: READ_ONLY mode is active")
     body = {
         "ticker": ticker,
         "action": "sell",
@@ -143,7 +128,9 @@ def get_order(order_id: str) -> dict:
 
 
 def cancel_order(order_id: str) -> None:
-    """Cancel an open order."""
+    """Cancel an open order. Blocked when READ_ONLY is true."""
+    if config.READ_ONLY:
+        raise RuntimeError("cancel_order blocked: READ_ONLY mode is active")
     authenticated_request("DELETE", f"/trade-api/v2/portfolio/orders/{order_id}")
 
 

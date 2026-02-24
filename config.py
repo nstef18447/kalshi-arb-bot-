@@ -1,3 +1,8 @@
+import os
+
+# --- Mode ---
+READ_ONLY = os.getenv("READ_ONLY", "true").lower() in ("true", "1", "yes")
+
 ARB_THRESHOLD = 95          # Max combined price in cents to trigger arb
 MAX_CONTRACTS = 25          # Contracts per leg
 POLL_INTERVAL = 5           # Seconds between scan cycles

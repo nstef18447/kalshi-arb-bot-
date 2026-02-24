@@ -49,6 +49,10 @@ def print_config():
     print(f"  Snapshot cache:  {config.SNAPSHOT_CACHE_SIZE} ({config.SNAPSHOT_CACHE_SIZE * config.POLL_INTERVAL}s history)")
     print(f"  Fee rate:        {config.FEE_RATE:.0%}")
     print(f"  Soft arb prob:   {config.SOFT_ARB_PROB_THRESHOLD:.0%}")
+    if config.READ_ONLY:
+        print(f"\n  MODE: READ-ONLY (scan only, no trading)")
+    else:
+        print(f"\n  MODE: LIVE TRADING")
     print(f"{'='*50}\n")
 
 
