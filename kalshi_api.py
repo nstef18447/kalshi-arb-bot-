@@ -89,7 +89,8 @@ def get_orderbook(ticker: str, depth: int = 1) -> dict:
     return data.get("orderbook", {})
 
 
-def create_order(ticker: str, side: str, price_cents: int, count: int) -> dict:
+def create_order(ticker: str, side: str, price_cents: int, count: int,
+                  post_only: bool = False) -> dict:
     """Place a limit order. Blocked when READ_ONLY is true."""
     if config.READ_ONLY:
         raise RuntimeError("create_order blocked: READ_ONLY mode is active")
@@ -101,6 +102,8 @@ def create_order(ticker: str, side: str, price_cents: int, count: int) -> dict:
         "yes_price" if side == "yes" else "no_price": price_cents,
         "count": count,
     }
+    if post_only:
+        body["post_only"] = True
     data = authenticated_request("POST", "/trade-api/v2/portfolio/orders", json_body=body)
     return data.get("order", {})
 
@@ -132,6 +135,15 @@ def cancel_order(order_id: str) -> None:
     if config.READ_ONLY:
         raise RuntimeError("cancel_order blocked: READ_ONLY mode is active")
     authenticated_request("DELETE", f"/trade-api/v2/portfolio/orders/{order_id}")
+
+
+def get_open_orders() -> list[dict]:
+    """Fetch all resting (open) orders."""
+    return _paginate(
+        "/trade-api/v2/portfolio/orders",
+        {"status": "resting", "limit": 200},
+        "orders",
+    )
 
 
 def get_positions() -> list[dict]:

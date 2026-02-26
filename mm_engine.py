@@ -11,6 +11,7 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 
+import config
 import mm_config as mc
 import mm_logger
 from kalshi_api import (
@@ -18,16 +19,13 @@ from kalshi_api import (
     create_order,
     get_balance,
     get_markets,
+    get_open_orders,
     get_order,
     get_orderbook,
     get_positions,
 )
 
 logger = logging.getLogger("mm-engine")
-
-# Fee config — pulled from config.SERIES for the MM_SERIES
-TAKER_FEE = 0.07
-MAKER_MULT = 0.0175
 
 
 @dataclass
@@ -46,6 +44,8 @@ class StrikeState:
     ask_order_id: str = ""
     bid_price: int = 0
     ask_price: int = 0
+    bid_last_remaining: int = 0  # track remaining_count to detect fill deltas
+    ask_last_remaining: int = 0
     inventory: int = 0           # positive = long yes, negative = long no
     yes_fills: deque = field(default_factory=deque)
     no_fills: deque = field(default_factory=deque)
@@ -55,6 +55,7 @@ class StrikeState:
 class MarketMaker:
     def __init__(self):
         self.running = False
+        self._stopped = False
         self.cycle_count = 0
         self.consecutive_errors = 0
         self.strikes: dict[str, StrikeState] = {}   # ticker -> StrikeState
@@ -62,6 +63,11 @@ class MarketMaker:
         self.last_strike_refresh = 0.0
         self.last_summary_time = 0.0
         self._starting_balance = 0
+
+        # Pull fee config from config.SERIES for this series
+        series_cfg = config.SERIES.get(mc.MM_SERIES, {})
+        self.taker_fee = series_cfg.get("taker_fee", 0.07)
+        self.maker_mult = series_cfg.get("maker_mult", 0.0175)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -93,6 +99,9 @@ class MarketMaker:
         self.stop()
 
     def stop(self):
+        if self._stopped:
+            return
+        self._stopped = True
         self.running = False
         self._cancel_all()
         self._log_final_state()
@@ -120,6 +129,24 @@ class MarketMaker:
                 logger.warning("Existing positions detected: %s", tickers)
         except Exception:
             logger.exception("Could not fetch positions")
+
+        # Cancel any stale orders from a previous session
+        try:
+            open_orders = get_open_orders()
+            if open_orders:
+                logger.warning("Found %d stale open orders — cancelling", len(open_orders))
+                for order in open_orders:
+                    oid = order.get("order_id", "")
+                    ticker = order.get("ticker", "?")
+                    try:
+                        cancel_order(oid)
+                        logger.info("Cancelled stale order %s on %s", oid, ticker)
+                    except Exception:
+                        logger.exception("Failed to cancel stale order %s", oid)
+            else:
+                logger.info("No stale open orders")
+        except Exception:
+            logger.exception("Could not fetch open orders")
 
     # ------------------------------------------------------------------
     # Main cycle
@@ -249,10 +276,11 @@ class MarketMaker:
                 book = get_orderbook(ticker, depth=1)
                 yes_levels = book.get("yes", [])
                 if yes_levels:
-                    yes_ask = yes_levels[0][0] if isinstance(yes_levels[0], list) else yes_levels[0].get("price", 50)
+                    # Best yes bid = highest price in the yes buy book
+                    best_yb = max(l[0] for l in yes_levels if isinstance(l, list))
                 else:
-                    yes_ask = 50
-                dist = abs(yes_ask - 50)
+                    best_yb = 50
+                dist = abs(best_yb - 50)
                 if dist < best_dist:
                     best_dist = dist
                     best_atm = m
@@ -428,6 +456,7 @@ class MarketMaker:
     def _place_bid(self, st: StrikeState, price: int):
         """Place bid = buy yes at price."""
         st.bid_price = price
+        st.bid_last_remaining = mc.MM_QUOTE_SIZE
         mm_logger.log_quote(st.ticker, "bid", price, mc.MM_QUOTE_SIZE, "place")
 
         if not mc.MM_CONFIRM:
@@ -435,15 +464,18 @@ class MarketMaker:
             return
 
         try:
-            order = create_order(st.ticker, "yes", price, mc.MM_QUOTE_SIZE)
+            order = create_order(st.ticker, "yes", price, mc.MM_QUOTE_SIZE,
+                                 post_only=True)
             st.bid_order_id = order.get("order_id", "")
         except Exception:
             logger.exception("Failed to place bid on %s at %d", st.ticker, price)
             st.bid_order_id = ""
+            st.bid_last_remaining = 0
 
     def _place_ask(self, st: StrikeState, price: int):
         """Place ask = buy no at (100 - price) to sell yes at price."""
         st.ask_price = price
+        st.ask_last_remaining = mc.MM_QUOTE_SIZE
         no_price = 100 - price
         mm_logger.log_quote(st.ticker, "ask", price, mc.MM_QUOTE_SIZE, "place")
 
@@ -452,12 +484,14 @@ class MarketMaker:
             return
 
         try:
-            order = create_order(st.ticker, "no", no_price, mc.MM_QUOTE_SIZE)
+            order = create_order(st.ticker, "no", no_price, mc.MM_QUOTE_SIZE,
+                                 post_only=True)
             st.ask_order_id = order.get("order_id", "")
         except Exception:
             logger.exception("Failed to place ask on %s at %d (no@%d)",
                              st.ticker, price, no_price)
             st.ask_order_id = ""
+            st.ask_last_remaining = 0
 
     def _cancel_if_active(self, st: StrikeState, side: str):
         """Cancel an existing order if it's active."""
@@ -466,8 +500,10 @@ class MarketMaker:
             # Clear dry-run or empty order
             if side == "bid":
                 st.bid_order_id = ""
+                st.bid_last_remaining = 0
             else:
                 st.ask_order_id = ""
+                st.ask_last_remaining = 0
             return
 
         try:
@@ -480,8 +516,10 @@ class MarketMaker:
 
         if side == "bid":
             st.bid_order_id = ""
+            st.bid_last_remaining = 0
         else:
             st.ask_order_id = ""
+            st.ask_last_remaining = 0
 
     # ------------------------------------------------------------------
     # Fill detection
@@ -504,26 +542,34 @@ class MarketMaker:
             return
 
         status = order_data.get("status", "")
-        initial_count = order_data.get("count", mc.MM_QUOTE_SIZE)  # total order size
-        remaining = order_data.get("remaining_count", initial_count)
-        filled_count = initial_count - remaining
+        remaining = order_data.get("remaining_count", 0)
 
-        if filled_count > 0:
+        # Compare against last known remaining to get the delta (new fills only)
+        last_remaining = st.bid_last_remaining if side == "bid" else st.ask_last_remaining
+        new_fills = last_remaining - remaining
+
+        if new_fills > 0:
+            # Update last_remaining to current
+            if side == "bid":
+                st.bid_last_remaining = remaining
+            else:
+                st.ask_last_remaining = remaining
+
             price = st.bid_price if side == "bid" else st.ask_price
             fill_side = "yes" if side == "bid" else "no"
 
             fill = Fill(
                 side=fill_side,
                 price=price if side == "bid" else (100 - price),
-                count=filled_count,
+                count=new_fills,
                 timestamp=time.time(),
             )
 
             if side == "bid":
-                st.inventory += filled_count
+                st.inventory += new_fills
                 st.yes_fills.append(fill)
             else:
-                st.inventory -= filled_count
+                st.inventory -= new_fills
                 st.no_fills.append(fill)
 
             # Match FIFO
@@ -532,17 +578,19 @@ class MarketMaker:
             # Log fill
             total_rpnl = sum(s.realized_pnl for s in self.strikes.values())
             mm_logger.log_fill(st.ticker, fill_side, fill.price,
-                               filled_count, st.inventory, total_rpnl)
+                               new_fills, st.inventory, total_rpnl)
             logger.info("FILL %s %s %dc x%d inv=%d rpnl=%.0fc",
-                        st.ticker, fill_side, fill.price, filled_count,
+                        st.ticker, fill_side, fill.price, new_fills,
                         st.inventory, st.realized_pnl)
 
-        # If order is fully filled or cancelled, clear it
+        # If order is fully filled or cancelled, clear it and reset tracking
         if status in ("filled", "cancelled"):
             if side == "bid":
                 st.bid_order_id = ""
+                st.bid_last_remaining = 0
             else:
                 st.ask_order_id = ""
+                st.ask_last_remaining = 0
 
     # ------------------------------------------------------------------
     # FIFO P&L matching
@@ -558,9 +606,9 @@ class MarketMaker:
 
             # Profit = payout (100c) - yes_price - no_price per contract
             gross = (100 - yes_fill.price - no_fill.price) * qty
-            # Estimate fees (maker rate on each leg)
-            yes_fee = MAKER_MULT * yes_fill.price * (100 - yes_fill.price) / 100 * qty
-            no_fee = MAKER_MULT * no_fill.price * (100 - no_fill.price) / 100 * qty
+            # Maker fees: maker_mult * P * (1-P) where P is in dollars (cents/100)
+            yes_fee = self.maker_mult * yes_fill.price * (100 - yes_fill.price) / 100 * qty
+            no_fee = self.maker_mult * no_fill.price * (100 - no_fill.price) / 100 * qty
             net = gross - yes_fee - no_fee
 
             st.realized_pnl += net
