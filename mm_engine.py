@@ -6,6 +6,7 @@ Quotes bid/ask on ATM strikes, captures spread P&L.
 
 import logging
 import signal
+import statistics
 import time
 import uuid
 from collections import deque
@@ -46,6 +47,8 @@ class StrikeState:
     ask_price: int = 0
     bid_last_remaining: int = 0  # track remaining_count to detect fill deltas
     ask_last_remaining: int = 0
+    bid_placed_at: float = 0.0   # timestamp when bid was placed (for stale detection)
+    ask_placed_at: float = 0.0   # timestamp when ask was placed (for stale detection)
     inventory: int = 0           # positive = long yes, negative = long no
     yes_fills: deque = field(default_factory=deque)
     no_fills: deque = field(default_factory=deque)
@@ -68,6 +71,20 @@ class MarketMaker:
         series_cfg = config.SERIES.get(mc.MM_SERIES, {})
         self.taker_fee = series_cfg.get("taker_fee", 0.07)
         self.maker_mult = series_cfg.get("maker_mult", 0.0175)
+
+        # Volatility tracking (rolling midprice history)
+        self.mid_history: deque = deque(maxlen=max(mc.MM_VOL_WINDOW, mc.MM_VOL_PAUSE_LOOKBACK))
+        self.current_half_spread = mc.MM_BASE_HALF_SPREAD
+        self.vol_paused = False
+
+        # Stats for 30-min summary
+        self.requotes_skipped = 0
+        self.requotes_needed = 0
+        self.queue_times: list[float] = []      # seconds each order rested before cancel/fill
+        self.vol_pauses_count = 0
+        self.vol_pause_total_seconds = 0.0
+        self._vol_pause_start = 0.0
+        self.spread_samples: list[int] = []     # half_spread values for avg/min/max
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -165,6 +182,38 @@ class MarketMaker:
             logger.warning("No strikes selected — skipping cycle")
             return
 
+        # --- Volatility tracking: record current midprice ---
+        sample_mid = self._sample_midprice()
+        if sample_mid is not None:
+            self.mid_history.append((now, sample_mid))
+
+        # --- Improvement 3: Volatility pause ---
+        if self._check_vol_pause(now):
+            # During vol pause: cancel all quotes, skip processing
+            if not self.vol_paused:
+                self.vol_paused = True
+                self._vol_pause_start = now
+                self.vol_pauses_count += 1
+                self._cancel_all()
+                logger.info("VOL PAUSE: large move detected, pulling all quotes")
+            move = self._recent_move()
+            print(f"[MM] VOL PAUSE: ${abs(move)/100:.2f} move in "
+                  f"{mc.MM_VOL_PAUSE_LOOKBACK * mc.MM_REQUOTE_INTERVAL}s — "
+                  f"quotes pulled")
+            return
+
+        if self.vol_paused:
+            # Resuming after vol pause
+            pause_dur = now - self._vol_pause_start
+            self.vol_pause_total_seconds += pause_dur
+            self.vol_paused = False
+            logger.info("VOL RESUME: volatility subsided after %.0fs, resuming quotes",
+                        pause_dur)
+
+        # --- Improvement 1: Dynamic spread ---
+        self.current_half_spread = self._calc_dynamic_spread()
+        self.spread_samples.append(self.current_half_spread)
+
         for ticker, st in list(self.strikes.items()):
             try:
                 self._process_strike(st)
@@ -184,11 +233,14 @@ class MarketMaker:
         # Stdout summary line
         for ticker, st in self.strikes.items():
             status = "HALTED" if self.halted else "QUOTING"
-            if abs(st.inventory) >= mc.MM_MAX_INVENTORY:
+            if self.vol_paused:
+                status = "VOL_PAUSE"
+            elif abs(st.inventory) >= mc.MM_MAX_INVENTORY:
                 status = "INV_LIMIT"
             upnl = self._estimate_upnl(st)
             print(f"[MM] {mc.MM_SERIES} {st.strike}: "
                   f"bid={st.bid_price} ask={st.ask_price} "
+                  f"spread={self.current_half_spread*2}c "
                   f"inv={st.inventory:+d} rpnl={st.realized_pnl:+.0f}c "
                   f"upnl={upnl:+.0f}c [{status}]")
 
@@ -196,6 +248,65 @@ class MarketMaker:
         if now - self.last_summary_time > 1800:
             self._print_summary()
             self.last_summary_time = now
+
+    # ------------------------------------------------------------------
+    # Volatility helpers
+    # ------------------------------------------------------------------
+
+    def _sample_midprice(self):
+        """Get a representative midprice from the first active strike's book."""
+        for st in self.strikes.values():
+            try:
+                book = get_orderbook(st.ticker, depth=1)
+                yes_levels = book.get("yes", [])
+                no_levels = book.get("no", [])
+                yb = self._best_bid(yes_levels)
+                nb = self._best_bid(no_levels)
+                if yb is not None and nb is not None:
+                    return (yb + (100 - nb)) / 2
+            except Exception:
+                continue
+        return None
+
+    def _calc_dynamic_spread(self):
+        """Calculate dynamic half spread from rolling volatility."""
+        if len(self.mid_history) < 2:
+            return mc.MM_BASE_HALF_SPREAD
+
+        # Get the last VOL_WINDOW observations
+        recent = list(self.mid_history)[-mc.MM_VOL_WINDOW:]
+        if len(recent) < 2:
+            return mc.MM_BASE_HALF_SPREAD
+
+        # Calculate stdev of price changes (mid[t] - mid[t-1])
+        changes = [recent[i][1] - recent[i-1][1] for i in range(1, len(recent))]
+        if not changes:
+            return mc.MM_BASE_HALF_SPREAD
+
+        try:
+            vol = statistics.stdev(changes) if len(changes) >= 2 else abs(changes[0])
+        except statistics.StatisticsError:
+            return mc.MM_BASE_HALF_SPREAD
+
+        dynamic = max(mc.MM_BASE_HALF_SPREAD, int(vol * mc.MM_VOL_MULTIPLIER))
+        dynamic = min(dynamic, mc.MM_MAX_HALF_SPREAD)
+        return dynamic
+
+    def _recent_move(self):
+        """Absolute price move over the last VOL_PAUSE_LOOKBACK scans."""
+        if len(self.mid_history) < 2:
+            return 0
+        lookback = mc.MM_VOL_PAUSE_LOOKBACK
+        recent = list(self.mid_history)
+        if len(recent) <= lookback:
+            return abs(recent[-1][1] - recent[0][1])
+        return abs(recent[-1][1] - recent[-lookback - 1][1])
+
+    def _check_vol_pause(self, now):
+        """Return True if we should be paused due to sharp price move."""
+        if len(self.mid_history) < mc.MM_VOL_PAUSE_LOOKBACK + 1:
+            return False
+        return self._recent_move() > mc.MM_VOL_PAUSE_THRESHOLD
 
     # ------------------------------------------------------------------
     # Strike selection
@@ -365,8 +476,8 @@ class MarketMaker:
         # 3. Compute quotes
         bid_target, ask_target = self._compute_quotes(st, book)
 
-        # 4. Manage orders
-        self._manage_orders(st, bid_target, ask_target)
+        # 4. Manage orders (pass book for spread-crossing checks)
+        self._manage_orders(st, bid_target, ask_target, book)
 
     def _compute_quotes(self, st: StrikeState, book: dict):
         """Compute target bid/ask prices from orderbook.
@@ -399,9 +510,10 @@ class MarketMaker:
         # Inventory skew: push mid away from inventory
         adjusted_mid = mid - (st.inventory * 1)
 
-        # Target prices
-        target_bid = int(adjusted_mid - mc.MM_HALF_SPREAD)
-        target_ask = int(adjusted_mid + mc.MM_HALF_SPREAD)
+        # Target prices (using dynamic spread)
+        half = self.current_half_spread
+        target_bid = int(adjusted_mid - half)
+        target_ask = int(adjusted_mid + half)
 
         # Safety clamps: don't cross the book
         target_bid = min(target_bid, derived_yes_ask - 1)  # bid below best ask
@@ -429,34 +541,75 @@ class MarketMaker:
     # Order management
     # ------------------------------------------------------------------
 
-    def _manage_orders(self, st: StrikeState, bid_target, ask_target):
+    def _manage_orders(self, st: StrikeState, bid_target, ask_target, book: dict):
+        now = time.time()
+        yes_levels = book.get("yes", [])
+        no_levels = book.get("no", [])
+        best_yes_bid = self._best_bid(yes_levels)
+        best_no_bid = self._best_bid(no_levels)
+        derived_yes_ask = (100 - best_no_bid) if best_no_bid is not None else None
+
         # Handle bid side
         if bid_target is not None and st.inventory < mc.MM_MAX_INVENTORY:
-            if st.bid_order_id and abs(st.bid_price - bid_target) <= mc.MM_QUOTE_TOLERANCE:
-                pass  # leave existing order
+            if st.bid_order_id and self._should_keep_order(
+                st, "bid", bid_target, derived_yes_ask, best_yes_bid, now
+            ):
+                self.requotes_skipped += 1
             else:
-                self._cancel_if_active(st, "bid")
+                self._cancel_if_active(st, "bid", now)
                 self._place_bid(st, bid_target)
+                self.requotes_needed += 1
         else:
-            # Pull bid: inventory at limit or no valid quote
-            self._cancel_if_active(st, "bid")
+            self._cancel_if_active(st, "bid", now)
             st.bid_price = 0
 
         # Handle ask side
         if ask_target is not None and st.inventory > -mc.MM_MAX_INVENTORY:
-            if st.ask_order_id and abs(st.ask_price - ask_target) <= mc.MM_QUOTE_TOLERANCE:
-                pass  # leave existing order
+            if st.ask_order_id and self._should_keep_order(
+                st, "ask", ask_target, derived_yes_ask, best_yes_bid, now
+            ):
+                self.requotes_skipped += 1
             else:
-                self._cancel_if_active(st, "ask")
+                self._cancel_if_active(st, "ask", now)
                 self._place_ask(st, ask_target)
+                self.requotes_needed += 1
         else:
-            self._cancel_if_active(st, "ask")
+            self._cancel_if_active(st, "ask", now)
             st.ask_price = 0
+
+    def _should_keep_order(self, st: StrikeState, side: str, target: int,
+                           derived_yes_ask, best_yes_bid, now: float) -> bool:
+        """Smart requote: decide whether to keep an existing order.
+
+        Keep if: within tolerance, correct side of spread, not stale.
+        Replace if: drifted too far, would cross spread, or resting > 5 min.
+        """
+        current_price = st.bid_price if side == "bid" else st.ask_price
+        placed_at = st.bid_placed_at if side == "bid" else st.ask_placed_at
+
+        # (a) Price within tolerance?
+        if abs(current_price - target) > mc.MM_QUOTE_TOLERANCE:
+            return False
+
+        # (b) Correct side of spread?
+        if side == "bid" and derived_yes_ask is not None:
+            if current_price >= derived_yes_ask:  # bid would cross ask
+                return False
+        if side == "ask" and best_yes_bid is not None:
+            if current_price <= best_yes_bid:  # ask would cross bid
+                return False
+
+        # (c) Not stale? (resting longer than MM_STALE_QUOTE_SECONDS)
+        if placed_at > 0 and (now - placed_at) > mc.MM_STALE_QUOTE_SECONDS:
+            return False
+
+        return True
 
     def _place_bid(self, st: StrikeState, price: int):
         """Place bid = buy yes at price."""
         st.bid_price = price
         st.bid_last_remaining = mc.MM_QUOTE_SIZE
+        st.bid_placed_at = time.time()
         mm_logger.log_quote(st.ticker, "bid", price, mc.MM_QUOTE_SIZE, "place")
 
         if not mc.MM_CONFIRM:
@@ -476,6 +629,7 @@ class MarketMaker:
         """Place ask = buy no at (100 - price) to sell yes at price."""
         st.ask_price = price
         st.ask_last_remaining = mc.MM_QUOTE_SIZE
+        st.ask_placed_at = time.time()
         no_price = 100 - price
         mm_logger.log_quote(st.ticker, "ask", price, mc.MM_QUOTE_SIZE, "place")
 
@@ -493,18 +647,26 @@ class MarketMaker:
             st.ask_order_id = ""
             st.ask_last_remaining = 0
 
-    def _cancel_if_active(self, st: StrikeState, side: str):
+    def _cancel_if_active(self, st: StrikeState, side: str, now: float = 0.0):
         """Cancel an existing order if it's active."""
         order_id = st.bid_order_id if side == "bid" else st.ask_order_id
+        placed_at = st.bid_placed_at if side == "bid" else st.ask_placed_at
+
         if not order_id or order_id.startswith("DRY-"):
             # Clear dry-run or empty order
             if side == "bid":
                 st.bid_order_id = ""
                 st.bid_last_remaining = 0
+                st.bid_placed_at = 0.0
             else:
                 st.ask_order_id = ""
                 st.ask_last_remaining = 0
+                st.ask_placed_at = 0.0
             return
+
+        # Track queue time (how long the order rested)
+        if now > 0 and placed_at > 0:
+            self.queue_times.append(now - placed_at)
 
         try:
             cancel_order(order_id)
@@ -517,9 +679,11 @@ class MarketMaker:
         if side == "bid":
             st.bid_order_id = ""
             st.bid_last_remaining = 0
+            st.bid_placed_at = 0.0
         else:
             st.ask_order_id = ""
             st.ask_last_remaining = 0
+            st.ask_placed_at = 0.0
 
     # ------------------------------------------------------------------
     # Fill detection
@@ -665,6 +829,39 @@ class MarketMaker:
     def _print_summary(self):
         total_rpnl = sum(s.realized_pnl for s in self.strikes.values())
         total_inv = sum(s.inventory for s in self.strikes.values())
+
+        # Spread stats
+        ss = self.spread_samples
+        spread_cur = self.current_half_spread * 2
+        spread_avg = (sum(ss) / len(ss) * 2) if ss else spread_cur
+        spread_min = (min(ss) * 2) if ss else spread_cur
+        spread_max = (max(ss) * 2) if ss else spread_cur
+        # Recent vol for display
+        vol_display = 0.0
+        if len(self.mid_history) >= 2:
+            recent = list(self.mid_history)[-mc.MM_VOL_WINDOW:]
+            changes = [recent[i][1] - recent[i-1][1] for i in range(1, len(recent))]
+            if len(changes) >= 2:
+                try:
+                    vol_display = statistics.stdev(changes)
+                except statistics.StatisticsError:
+                    pass
+
+        # Queue stats
+        avg_rest = (sum(self.queue_times) / len(self.queue_times)) if self.queue_times else 0
+
         print(f"\n[MM SUMMARY] rpnl={total_rpnl:+.0f}c "
               f"inv={total_inv:+d} cycles={self.cycle_count} "
               f"strikes={len(self.strikes)}")
+        print(f"  Spread: current={spread_cur}c avg={spread_avg:.0f}c "
+              f"min={spread_min}c max={spread_max}c vol={vol_display:.1f}c")
+        print(f"  Queue: {self.requotes_skipped} skipped, "
+              f"{self.requotes_needed} replaced, avg_rest={avg_rest:.0f}s")
+        print(f"  Vol pauses: {self.vol_pauses_count} times, "
+              f"{self.vol_pause_total_seconds:.0f}s total paused")
+
+        # Reset periodic counters
+        self.spread_samples.clear()
+        self.requotes_skipped = 0
+        self.requotes_needed = 0
+        self.queue_times.clear()
