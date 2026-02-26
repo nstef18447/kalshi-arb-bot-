@@ -341,25 +341,31 @@ class MarketMaker:
         self._manage_orders(st, bid_target, ask_target)
 
     def _compute_quotes(self, st: StrikeState, book: dict):
-        """Compute target bid/ask prices from orderbook."""
-        yes_bids = book.get("yes", [])
-        no_bids = book.get("no", [])
+        """Compute target bid/ask prices from orderbook.
 
-        # Extract best prices
-        best_yes_bid = self._best_price(yes_bids, side="bid")
-        best_yes_ask = self._best_price(yes_bids, side="ask")
-        best_no_bid = self._best_price(no_bids, side="bid")
+        Kalshi orderbook: 'yes' and 'no' arrays each contain BUY orders
+        (bids) as [[price, qty], ...].
+        - best_yes_bid = highest yes buy price
+        - best_no_bid = highest no buy price
+        - derived yes_ask = 100 - best_no_bid (selling yes = buying no)
+        - native spread = derived_yes_ask - best_yes_bid
+        """
+        yes_levels = book.get("yes", [])
+        no_levels = book.get("no", [])
+
+        best_yes_bid = self._best_bid(yes_levels)
+        best_no_bid = self._best_bid(no_levels)
 
         if best_yes_bid is None or best_no_bid is None:
             return None, None
 
-        # Native spread check
-        native_spread = best_yes_ask - best_yes_bid if best_yes_ask else 100
+        derived_yes_ask = 100 - best_no_bid
+        native_spread = derived_yes_ask - best_yes_bid
+
         if native_spread < mc.MM_MIN_BOOK_SPREAD:
             return None, None
 
-        # Mid from yes_bid and derived yes_ask (100 - no_bid)
-        derived_yes_ask = 100 - best_no_bid
+        # Mid from best yes bid and derived yes ask
         mid = (best_yes_bid + derived_yes_ask) / 2
 
         # Inventory skew: push mid away from inventory
@@ -369,11 +375,9 @@ class MarketMaker:
         target_bid = int(adjusted_mid - mc.MM_HALF_SPREAD)
         target_ask = int(adjusted_mid + mc.MM_HALF_SPREAD)
 
-        # Safety clamps
-        if best_yes_ask is not None:
-            target_bid = min(target_bid, best_yes_ask - 1)
-        if best_yes_bid is not None:
-            target_ask = max(target_ask, best_yes_bid + 1)
+        # Safety clamps: don't cross the book
+        target_bid = min(target_bid, derived_yes_ask - 1)  # bid below best ask
+        target_ask = max(target_ask, best_yes_bid + 1)     # ask above best bid
         target_bid = max(1, target_bid)
         target_ask = min(99, target_ask)
         if target_bid >= target_ask:
@@ -381,12 +385,8 @@ class MarketMaker:
 
         return target_bid, target_ask
 
-    def _best_price(self, levels, side="bid"):
-        """Extract best bid or ask from orderbook levels.
-
-        Kalshi orderbook format: list of [price, quantity] pairs.
-        For bids: highest price. For asks: lowest price.
-        """
+    def _best_bid(self, levels):
+        """Extract highest bid price from orderbook levels [[price, qty], ...]."""
         if not levels:
             return None
         prices = []
@@ -395,9 +395,7 @@ class MarketMaker:
                 prices.append(level[0])
             elif isinstance(level, dict):
                 prices.append(level.get("price", 0))
-        if not prices:
-            return None
-        return max(prices) if side == "bid" else min(prices)
+        return max(prices) if prices else None
 
     # ------------------------------------------------------------------
     # Order management
