@@ -21,10 +21,13 @@ MM_BASE_HALF_SPREAD = int(os.getenv("MM_BASE_HALF_SPREAD", str(MM_HALF_SPREAD)))
 MM_VOL_MULTIPLIER = float(os.getenv("MM_VOL_MULTIPLIER", "2.0"))
 MM_MAX_HALF_SPREAD = int(os.getenv("MM_MAX_HALF_SPREAD", "15"))
 MM_VOL_WINDOW = int(os.getenv("MM_VOL_WINDOW", "60"))  # scans (60 * 5s = 5 min)
+MM_VOL_EMA_ALPHA = float(os.getenv("MM_VOL_EMA_ALPHA", "0.3"))  # EMA smoothing factor
 
-# --- Volatility pause ---
-MM_VOL_PAUSE_THRESHOLD = int(os.getenv("MM_VOL_PAUSE_THRESHOLD", "200"))  # cents move in lookback
-MM_VOL_PAUSE_LOOKBACK = int(os.getenv("MM_VOL_PAUSE_LOOKBACK", "12"))     # scans (12 * 5s = 60s)
+# --- Volatility pause (dual trigger) ---
+MM_VOL_PAUSE_THRESHOLD = float(os.getenv("MM_VOL_PAUSE_THRESHOLD", "0.003"))  # 0.3% ATM strike move
+MM_MID_MOVE_PAUSE = int(os.getenv("MM_MID_MOVE_PAUSE", "15"))  # cents contract mid move in lookback
+MM_VOL_PAUSE_LOOKBACK = int(os.getenv("MM_VOL_PAUSE_LOOKBACK", "12"))  # scans (12 * 5s = 60s)
 
 # --- Smart requoting ---
 MM_STALE_QUOTE_SECONDS = int(os.getenv("MM_STALE_QUOTE_SECONDS", "300"))  # 5 minutes
+MM_COMPETITIVENESS_CHECK_AGE = int(os.getenv("MM_COMPETITIVENESS_CHECK_AGE", "30"))  # seconds

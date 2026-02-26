@@ -5,6 +5,7 @@ Quotes bid/ask on ATM strikes, captures spread P&L.
 """
 
 import logging
+import math
 import signal
 import statistics
 import time
@@ -73,9 +74,15 @@ class MarketMaker:
         self.maker_mult = series_cfg.get("maker_mult", 0.0175)
 
         # Volatility tracking (rolling midprice history)
-        self.mid_history: deque = deque(maxlen=max(mc.MM_VOL_WINDOW, mc.MM_VOL_PAUSE_LOOKBACK))
+        self.mid_history: deque = deque(maxlen=max(mc.MM_VOL_WINDOW, mc.MM_VOL_PAUSE_LOOKBACK) + 1)
         self.current_half_spread = mc.MM_BASE_HALF_SPREAD
+        self.ema_vol = 0.0  # EMA-smoothed volatility
         self.vol_paused = False
+
+        # ATM strike tracking (for vol pause % check and midprice sampling)
+        self.atm_ticker = ""
+        self.current_atm_strike: float = 0.0
+        self.atm_strike_history: deque = deque(maxlen=mc.MM_VOL_PAUSE_LOOKBACK + 1)
 
         # Stats for 30-min summary
         self.requotes_skipped = 0
@@ -182,33 +189,39 @@ class MarketMaker:
             logger.warning("No strikes selected — skipping cycle")
             return
 
-        # --- Volatility tracking: record current midprice ---
+        # --- Volatility tracking: record current midprice + ATM strike ---
         sample_mid = self._sample_midprice()
         if sample_mid is not None:
             self.mid_history.append((now, sample_mid))
+        if self.current_atm_strike > 0:
+            self.atm_strike_history.append((now, self.current_atm_strike))
 
-        # --- Improvement 3: Volatility pause ---
-        if self._check_vol_pause(now):
-            # During vol pause: cancel all quotes, skip processing
-            if not self.vol_paused:
-                self.vol_paused = True
-                self._vol_pause_start = now
-                self.vol_pauses_count += 1
-                self._cancel_all()
-                logger.info("VOL PAUSE: large move detected, pulling all quotes")
-            move = self._recent_move()
-            print(f"[MM] VOL PAUSE: ${abs(move)/100:.2f} move in "
-                  f"{mc.MM_VOL_PAUSE_LOOKBACK * mc.MM_REQUOTE_INTERVAL}s — "
-                  f"quotes pulled")
-            return
-
+        # --- Volatility pause logic ---
         if self.vol_paused:
-            # Resuming after vol pause
-            pause_dur = now - self._vol_pause_start
-            self.vol_pause_total_seconds += pause_dur
-            self.vol_paused = False
-            logger.info("VOL RESUME: volatility subsided after %.0fs, resuming quotes",
-                        pause_dur)
+            # During pause: keep collecting data, check if safe to resume
+            if self._check_vol_resume(now):
+                pause_dur = now - self._vol_pause_start
+                self.vol_pause_total_seconds += pause_dur
+                self.vol_paused = False
+                logger.info("VOL PAUSE held for %.0fs, resuming with fresh ema_vol=%.1fc",
+                            pause_dur, self.ema_vol)
+            else:
+                mid_move = self._recent_mid_move()
+                elapsed = now - self._vol_pause_start
+                print(f"[MM] VOL PAUSE: {mid_move:.0f}c mid move — "
+                      f"quotes pulled ({elapsed:.0f}s elapsed)")
+                return
+
+        elif self._check_vol_pause(now):
+            # Enter vol pause
+            self.vol_paused = True
+            self._vol_pause_start = now
+            self.vol_pauses_count += 1
+            self._cancel_all()
+            mid_move = self._recent_mid_move()
+            logger.info("VOL PAUSE: mid_move=%.0fc — pulling all quotes", mid_move)
+            print(f"[MM] VOL PAUSE: {mid_move:.0f}c mid move — quotes pulled")
+            return
 
         # --- Improvement 1: Dynamic spread ---
         self.current_half_spread = self._calc_dynamic_spread()
@@ -254,8 +267,18 @@ class MarketMaker:
     # ------------------------------------------------------------------
 
     def _sample_midprice(self):
-        """Get a representative midprice from the first active strike's book."""
-        for st in self.strikes.values():
+        """Get midprice from the ATM strike's orderbook (contract price, not BTC).
+
+        Uses the ATM strike specifically so all strikes share a single
+        volatility regime. Falls back to any strike if ATM unavailable.
+        """
+        # Prefer ATM strike for consistent vol measurement
+        ordered = []
+        if self.atm_ticker and self.atm_ticker in self.strikes:
+            ordered.append(self.strikes[self.atm_ticker])
+        ordered.extend(st for st in self.strikes.values() if st.ticker != self.atm_ticker)
+
+        for st in ordered:
             try:
                 book = get_orderbook(st.ticker, depth=1)
                 yes_levels = book.get("yes", [])
@@ -269,33 +292,45 @@ class MarketMaker:
         return None
 
     def _calc_dynamic_spread(self):
-        """Calculate dynamic half spread from rolling volatility."""
-        if len(self.mid_history) < 2:
+        """Calculate dynamic half spread from EMA-smoothed rolling volatility.
+
+        Uses contract midprice changes (not BTC spot) with EMA smoothing
+        to reduce jitter. Requires >= 10 observations before computing.
+        """
+        # Need at least 10 observations for meaningful stdev
+        if len(self.mid_history) < 10:
             return mc.MM_BASE_HALF_SPREAD
 
         # Get the last VOL_WINDOW observations
         recent = list(self.mid_history)[-mc.MM_VOL_WINDOW:]
-        if len(recent) < 2:
+        if len(recent) < 10:
             return mc.MM_BASE_HALF_SPREAD
 
         # Calculate stdev of price changes (mid[t] - mid[t-1])
         changes = [recent[i][1] - recent[i-1][1] for i in range(1, len(recent))]
-        if not changes:
-            return mc.MM_BASE_HALF_SPREAD
 
         try:
-            vol = statistics.stdev(changes) if len(changes) >= 2 else abs(changes[0])
+            raw_vol = statistics.stdev(changes) if len(changes) >= 2 else abs(changes[0])
         except statistics.StatisticsError:
             return mc.MM_BASE_HALF_SPREAD
 
-        dynamic = max(mc.MM_BASE_HALF_SPREAD, int(vol * mc.MM_VOL_MULTIPLIER))
+        # EMA smoothing to reduce jitter
+        alpha = mc.MM_VOL_EMA_ALPHA
+        if self.ema_vol == 0.0:
+            self.ema_vol = raw_vol  # initialize on first computation
+        else:
+            self.ema_vol = alpha * raw_vol + (1 - alpha) * self.ema_vol
+
+        # Conservative rounding — wider is safer than tighter
+        dynamic = max(mc.MM_BASE_HALF_SPREAD,
+                      math.ceil(self.ema_vol * mc.MM_VOL_MULTIPLIER))
         dynamic = min(dynamic, mc.MM_MAX_HALF_SPREAD)
         return dynamic
 
-    def _recent_move(self):
-        """Absolute price move over the last VOL_PAUSE_LOOKBACK scans."""
+    def _recent_mid_move(self):
+        """Absolute contract midprice move over the last VOL_PAUSE_LOOKBACK scans."""
         if len(self.mid_history) < 2:
-            return 0
+            return 0.0
         lookback = mc.MM_VOL_PAUSE_LOOKBACK
         recent = list(self.mid_history)
         if len(recent) <= lookback:
@@ -303,10 +338,65 @@ class MarketMaker:
         return abs(recent[-1][1] - recent[-lookback - 1][1])
 
     def _check_vol_pause(self, now):
-        """Return True if we should be paused due to sharp price move."""
-        if len(self.mid_history) < mc.MM_VOL_PAUSE_LOOKBACK + 1:
-            return False
-        return self._recent_move() > mc.MM_VOL_PAUSE_THRESHOLD
+        """Return True if we should pause — dual trigger.
+
+        Trigger 1: Contract midprice moved > MM_MID_MOVE_PAUSE cents in lookback.
+        Trigger 2: ATM strike shifted by > MM_VOL_PAUSE_THRESHOLD % of BTC price.
+        Whichever fires first.
+        """
+        # Trigger 1: Contract mid move (primary)
+        if len(self.mid_history) >= mc.MM_VOL_PAUSE_LOOKBACK + 1:
+            if self._recent_mid_move() > mc.MM_MID_MOVE_PAUSE:
+                return True
+
+        # Trigger 2: ATM strike % move (backstop for large BTC moves)
+        if len(self.atm_strike_history) >= 2:
+            lookback = mc.MM_VOL_PAUSE_LOOKBACK
+            history = list(self.atm_strike_history)
+            if len(history) > lookback:
+                old_strike = history[-lookback - 1][1]
+                new_strike = history[-1][1]
+            else:
+                old_strike = history[0][1]
+                new_strike = history[-1][1]
+            if old_strike > 0 and new_strike != old_strike:
+                btc_move_pct = abs(new_strike - old_strike) / new_strike
+                if btc_move_pct > mc.MM_VOL_PAUSE_THRESHOLD:
+                    return True
+
+        return False
+
+    def _check_vol_resume(self, now):
+        """Check if safe to resume after vol pause.
+
+        Requires: minimum pause duration elapsed, AND fresh post-pause
+        data shows volatility below thresholds.
+        """
+        min_pause_seconds = mc.MM_VOL_PAUSE_LOOKBACK * mc.MM_REQUOTE_INTERVAL
+        if now - self._vol_pause_start < min_pause_seconds:
+            return False  # haven't waited long enough
+
+        # Get only fresh samples collected DURING the pause
+        fresh = [(t, m) for t, m in self.mid_history if t >= self._vol_pause_start]
+        if len(fresh) < mc.MM_VOL_PAUSE_LOOKBACK:
+            return False  # not enough fresh data yet
+
+        # Check fresh contract mid move
+        recent_fresh = fresh[-mc.MM_VOL_PAUSE_LOOKBACK:]
+        mid_move = abs(recent_fresh[-1][1] - recent_fresh[0][1])
+        if mid_move > mc.MM_MID_MOVE_PAUSE:
+            return False  # still volatile
+
+        # Check fresh ATM strike % move
+        fresh_atm = [(t, s) for t, s in self.atm_strike_history if t >= self._vol_pause_start]
+        if len(fresh_atm) >= 2:
+            atm_old = fresh_atm[0][1]
+            atm_new = fresh_atm[-1][1]
+            if atm_new > 0 and atm_old != atm_new:
+                if abs(atm_new - atm_old) / atm_new > mc.MM_VOL_PAUSE_THRESHOLD:
+                    return False
+
+        return True
 
     # ------------------------------------------------------------------
     # Strike selection
@@ -400,6 +490,10 @@ class MarketMaker:
 
         if best_atm is None:
             best_atm = candidates[len(candidates) // 2]
+
+        # Track ATM for vol sampling and strike % move detection
+        self.atm_ticker = best_atm.get("ticker", "")
+        self.current_atm_strike = best_atm["_strike"]
 
         atm_idx = candidates.index(best_atm)
 
@@ -581,27 +675,40 @@ class MarketMaker:
                            derived_yes_ask, best_yes_bid, now: float) -> bool:
         """Smart requote: decide whether to keep an existing order.
 
-        Keep if: within tolerance, correct side of spread, not stale.
-        Replace if: drifted too far, would cross spread, or resting > 5 min.
+        Keep if: within tolerance, correct side of spread, competitive, not stale.
+        Replace if: drifted too far, would cross spread, behind best quote
+        for > 30s, or resting > 5 min without fills.
         """
         current_price = st.bid_price if side == "bid" else st.ask_price
         placed_at = st.bid_placed_at if side == "bid" else st.ask_placed_at
+        order_age = (now - placed_at) if placed_at > 0 else 0.0
 
         # (a) Price within tolerance?
         if abs(current_price - target) > mc.MM_QUOTE_TOLERANCE:
             return False
 
-        # (b) Correct side of spread?
+        # (b) Correct side of spread? (safety — never cross)
         if side == "bid" and derived_yes_ask is not None:
-            if current_price >= derived_yes_ask:  # bid would cross ask
+            if current_price >= derived_yes_ask:
                 return False
         if side == "ask" and best_yes_bid is not None:
-            if current_price <= best_yes_bid:  # ask would cross bid
+            if current_price <= best_yes_bid:
                 return False
 
-        # (c) Not stale? (resting longer than MM_STALE_QUOTE_SECONDS)
-        if placed_at > 0 and (now - placed_at) > mc.MM_STALE_QUOTE_SECONDS:
+        # (c) Not stale? (resting > MM_STALE_QUOTE_SECONDS without fills)
+        if placed_at > 0 and order_age > mc.MM_STALE_QUOTE_SECONDS:
             return False
+
+        # (d) Competitiveness: are we still the best quote?
+        #     If behind for > 30s, requote to improve queue position.
+        #     Don't tighten below base_half_spread (avoid penny wars).
+        if order_age > mc.MM_COMPETITIVENESS_CHECK_AGE:
+            if side == "bid" and best_yes_bid is not None:
+                if current_price < best_yes_bid:
+                    return False  # someone posted a better bid
+            if side == "ask" and derived_yes_ask is not None:
+                if current_price > derived_yes_ask:
+                    return False  # someone posted a tighter ask
 
         return True
 
@@ -716,8 +823,10 @@ class MarketMaker:
             # Update last_remaining to current
             if side == "bid":
                 st.bid_last_remaining = remaining
+                st.bid_placed_at = time.time()  # reset stale timer on partial fill
             else:
                 st.ask_last_remaining = remaining
+                st.ask_placed_at = time.time()  # reset stale timer on partial fill
 
             price = st.bid_price if side == "bid" else st.ask_price
             fill_side = "yes" if side == "bid" else "no"
@@ -836,16 +945,7 @@ class MarketMaker:
         spread_avg = (sum(ss) / len(ss) * 2) if ss else spread_cur
         spread_min = (min(ss) * 2) if ss else spread_cur
         spread_max = (max(ss) * 2) if ss else spread_cur
-        # Recent vol for display
-        vol_display = 0.0
-        if len(self.mid_history) >= 2:
-            recent = list(self.mid_history)[-mc.MM_VOL_WINDOW:]
-            changes = [recent[i][1] - recent[i-1][1] for i in range(1, len(recent))]
-            if len(changes) >= 2:
-                try:
-                    vol_display = statistics.stdev(changes)
-                except statistics.StatisticsError:
-                    pass
+        vol_display = self.ema_vol
 
         # Queue stats
         avg_rest = (sum(self.queue_times) / len(self.queue_times)) if self.queue_times else 0
