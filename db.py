@@ -49,6 +49,21 @@ CREATE TABLE IF NOT EXISTS opportunities (
     depth_thin_side INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS arb_stability (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp REAL NOT NULL,
+    series_ticker TEXT NOT NULL DEFAULT '',
+    expiry_window TEXT NOT NULL,
+    strike_low REAL NOT NULL,
+    strike_high REAL NOT NULL,
+    combined_cost INTEGER NOT NULL,
+    depth_thin_side INTEGER,
+    first_seen REAL NOT NULL,
+    scan_count INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'open',
+    close_reason TEXT
+);
+
 CREATE TABLE IF NOT EXISTS trades (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp REAL NOT NULL,
@@ -67,6 +82,40 @@ CREATE TABLE IF NOT EXISTS trades (
     realized_pnl REAL,
     fees REAL
 );
+
+CREATE TABLE IF NOT EXISTS mm_quotes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp REAL NOT NULL,
+    ticker TEXT NOT NULL,
+    side TEXT NOT NULL,
+    price INTEGER NOT NULL,
+    size INTEGER NOT NULL,
+    action TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS mm_fills (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp REAL NOT NULL,
+    ticker TEXT NOT NULL,
+    side TEXT NOT NULL,
+    price INTEGER NOT NULL,
+    count INTEGER NOT NULL,
+    inventory_after INTEGER NOT NULL,
+    realized_pnl_cumulative REAL NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS mm_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp REAL NOT NULL,
+    cycle INTEGER NOT NULL,
+    ticker TEXT NOT NULL,
+    strike REAL NOT NULL,
+    bid_price INTEGER,
+    ask_price INTEGER,
+    inventory INTEGER NOT NULL DEFAULT 0,
+    strike_realized_pnl REAL NOT NULL DEFAULT 0,
+    total_realized_pnl REAL NOT NULL DEFAULT 0
+);
 """
 
 # Indexes — created after migrations so columns exist
@@ -83,6 +132,15 @@ CREATE INDEX IF NOT EXISTS idx_opps_type ON opportunities(opp_type, sub_type);
 CREATE INDEX IF NOT EXISTS idx_opps_expiry ON opportunities(expiry_window);
 CREATE INDEX IF NOT EXISTS idx_opps_series ON opportunities(series_ticker);
 CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(timestamp);
+CREATE INDEX IF NOT EXISTS idx_stability_ts ON arb_stability(timestamp);
+CREATE INDEX IF NOT EXISTS idx_stability_status ON arb_stability(status);
+CREATE INDEX IF NOT EXISTS idx_stability_pair ON arb_stability(expiry_window, strike_low, strike_high);
+CREATE INDEX IF NOT EXISTS idx_mm_quotes_ts ON mm_quotes(timestamp);
+CREATE INDEX IF NOT EXISTS idx_mm_quotes_ticker ON mm_quotes(ticker);
+CREATE INDEX IF NOT EXISTS idx_mm_fills_ts ON mm_fills(timestamp);
+CREATE INDEX IF NOT EXISTS idx_mm_fills_ticker ON mm_fills(ticker);
+CREATE INDEX IF NOT EXISTS idx_mm_snapshots_ts ON mm_snapshots(timestamp);
+CREATE INDEX IF NOT EXISTS idx_mm_snapshots_cycle ON mm_snapshots(cycle);
 """
 
 

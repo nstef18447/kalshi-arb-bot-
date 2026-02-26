@@ -82,6 +82,8 @@ class ArbBot:
         # Ladder snapshot cache: expiry -> deque of recent snapshots
         self.snapshot_cache: dict[str, deque] = {}
         self.last_summary_time: float = 0.0
+        self.scan_count: int = 0
+        self.cycle_counter: dict[str, int] = {s: 0 for s in config.SERIES}
 
     def start(self):
         self.running = True
@@ -109,11 +111,25 @@ class ArbBot:
     # ------------------------------------------------------------------
 
     def _scan_cycle(self):
+        self.scan_count += 1
+        cycle_start = time.monotonic()
+        timing = {}  # series -> {api_ms, ladder_ms, detect_ms, db_ms}
+
         for series, fee_cfg in config.SERIES.items():
             taker_fee = fee_cfg["taker_fee"]
             maker_mult = fee_cfg["maker_mult"]
+            contract_type = fee_cfg.get("contract_type", "above_below")
+            is_arb_eligible = contract_type == "above_below"
 
+            # Check per-series poll interval
+            poll_every = fee_cfg.get("poll_every", 1)
+            self.cycle_counter[series] = self.cycle_counter.get(series, 0) + 1
+            if self.cycle_counter[series] % poll_every != 0:
+                continue
+
+            t0 = time.monotonic()
             markets = kalshi_api.get_markets(series, status="open")
+            t_api = time.monotonic()
             logger.info("Found %d open markets for %s", len(markets), series)
 
             if not markets:
@@ -130,22 +146,53 @@ class ArbBot:
                 logger.warning("Max exposure reached, skipping scan")
                 return
 
+            # Log event durations on first cycle
+            if not hasattr(self, "_logged_event_durations"):
+                self._logged_event_durations = set()
+            for m in markets[:1]:  # just check first market per series
+                ct = m.get("close_time", "")
+                ot = m.get("open_time", "")
+                evt = m.get("event_ticker", "")
+                if ct and ot and evt not in self._logged_event_durations:
+                    self._logged_event_durations.add(evt)
+                    try:
+                        ct_ts = _parse_expiry_timestamp(ct)
+                        ot_ts = _parse_expiry_timestamp(ot)
+                        dur_h = (ct_ts - ot_ts) / 3600
+                        logger.info(
+                            "%s event %s: duration=%.1fh close=%s",
+                            series, evt, dur_h, ct,
+                        )
+                    except Exception:
+                        pass
+
             # Build ladder snapshots for all expiry windows (timed)
-            scan_start = time.monotonic()
+            t_ladder_start = time.monotonic()
             ladders = build_ladder(markets)
-            scan_duration_ms = (time.monotonic() - scan_start) * 1000
+            t_ladder = time.monotonic()
+            scan_duration_ms = (t_ladder - t_ladder_start) * 1000
+
+            t_detect_start = time.monotonic()
 
             # Cache + log + detect for each window
             for expiry, snapshot in ladders.items():
                 self._cache_snapshot(expiry, snapshot)
-                opportunities, stale_counts = detect_violations(
-                    snapshot, taker_fee, config.SOFT_ARB_PROB_THRESHOLD
-                )
-                ranked = rank_opportunities(opportunities)
+
+                # Only run arb detection on above/below contracts
+                if is_arb_eligible:
+                    opportunities, stale_counts = detect_violations(
+                        snapshot, taker_fee, config.SOFT_ARB_PROB_THRESHOLD
+                    )
+                    ranked = rank_opportunities(opportunities)
+                else:
+                    ranked = []
+                    stale_counts = {}
+
                 log_ladder(snapshot, ranked, series_ticker=series,
                            stale_counts=stale_counts)
 
                 # ── DB logging: scan, snapshot, opportunities ──
+                # expiry is now close_time (when trading stops), not settlement date
                 now_ts = time.time()
                 expiry_ts = _parse_expiry_timestamp(expiry)
                 ttl = max(0.0, expiry_ts - now_ts) if expiry_ts > 0 else None
@@ -204,7 +251,31 @@ class ArbBot:
                     except Exception:
                         logger.warning("db_logger.log_opportunity failed", exc_info=True)
 
+                # ── Arb stability tracking ──
+                hard_arbs = [
+                    opp for opp in ranked if opp.type == "C_hard_arb"
+                ]
+                stability_arbs = []
+                for opp in hard_arbs:
+                    lo_s = strike_map.get(opp.strikes[0])
+                    hi_s = strike_map.get(opp.strikes[1]) if len(opp.strikes) > 1 else None
+                    depth = None
+                    if lo_s and hi_s:
+                        depth = min(lo_s.yes_ask_depth, hi_s.no_ask_depth)
+                    stability_arbs.append({
+                        "strike_low": opp.strikes[0],
+                        "strike_high": opp.strikes[1] if len(opp.strikes) > 1 else opp.strikes[0],
+                        "combined_cost": opp.legs[0]["price"] + (opp.legs[1]["price"] if len(opp.legs) > 1 else 0),
+                        "depth_thin_side": depth,
+                    })
+                try:
+                    db_logger.update_arb_stability(expiry, stability_arbs, series_ticker=series)
+                except Exception:
+                    logger.warning("db_logger.update_arb_stability failed", exc_info=True)
+
                 # Execute single-market arb on each strike (scan-only in READ_ONLY)
+                if not is_arb_eligible:
+                    continue
                 for strike in snapshot.strikes:
                     if strike.ticker in self.traded_tickers:
                         continue
@@ -222,7 +293,30 @@ class ArbBot:
                                 strike.no_ask_depth,
                                 expiry_window=expiry,
                                 strike_price=strike.strike,
+                                taker_fee=taker_fee,
                             )
+
+            t_end = time.monotonic()
+            timing[series] = {
+                "api_ms": (t_api - t0) * 1000,
+                "ladder_ms": (t_ladder - t_ladder_start) * 1000,
+                "detect_db_ms": (t_end - t_detect_start) * 1000,
+                "total_ms": (t_end - t0) * 1000,
+            }
+
+        # Log timing breakdown every 10 cycles
+        if self.scan_count % 10 == 0 and timing:
+            cycle_ms = (time.monotonic() - cycle_start) * 1000
+            parts = []
+            for s, t in timing.items():
+                parts.append(
+                    f"{s}: api={t['api_ms']:.0f} ladder={t['ladder_ms']:.0f} "
+                    f"detect+db={t['detect_db_ms']:.0f} total={t['total_ms']:.0f}"
+                )
+            logger.info(
+                "=== CYCLE #%d TIMING (%.0fms total) === %s",
+                self.scan_count, cycle_ms, " | ".join(parts),
+            )
 
         # --- 30-minute maker strategy summary (once per cycle, after all series) ---
         now_mono = time.monotonic()
@@ -253,6 +347,18 @@ class ArbBot:
             except Exception:
                 logger.warning("Maker summary query failed", exc_info=True)
 
+            # Stability summary
+            try:
+                stab = db_logger.get_stability_summary(window_seconds=1800)
+                if stab:
+                    logger.info(
+                        "=== 30-MIN STABILITY === closed=%d | avg_scans=%.1f | avg_duration=%.0fs",
+                        stab["total_closed"], stab["avg_scan_count"],
+                        stab["avg_duration_seconds"],
+                    )
+            except Exception:
+                logger.warning("Stability summary failed", exc_info=True)
+
     def _cache_snapshot(self, expiry: str, snapshot):
         """Store snapshot in rolling cache for trend analysis."""
         if expiry not in self.snapshot_cache:
@@ -265,10 +371,10 @@ class ArbBot:
 
     def _execute_arb(self, ticker: str, yes_price: int, yes_depth: int,
                      no_price: int, no_depth: int,
-                     expiry_window: str = "", strike_price: float = 0.0):
+                     expiry_window: str = "", strike_price: float = 0.0,
+                     taker_fee: float = 0.07):
         now = datetime.now(timezone.utc).strftime("%H:%M:%S")
         count = config.MAX_CONTRACTS
-        fee_per_leg = config.FEE_RATE * 100  # cents
 
         # --- 1. PRE-FLIGHT LIQUIDITY CHECK ---
         if yes_depth < config.MIN_DEPTH:
@@ -342,7 +448,7 @@ class ArbBot:
         except Exception:
             logger.exception("[%s] %s FAIL: could not place second leg (%s)", now, ticker, second_side)
             self._handle_orphan(ticker, first_side, first_price, count, now,
-                                expiry_window, strike_price)
+                                expiry_window, strike_price, taker_fee)
             return
 
         second_id = second_order.get("order_id", "")
@@ -371,7 +477,7 @@ class ArbBot:
                     leg2_fill_status="filled",
                     orphaned=False,
                     realized_pnl=float(profit * count),
-                    fees=fee_per_leg * 2,
+                    fees=_maker_fee(yes_price, taker_fee) + _maker_fee(no_price, taker_fee),
                 )
             except Exception:
                 logger.warning("db_logger.log_trade failed", exc_info=True)
@@ -384,7 +490,7 @@ class ArbBot:
         )
         self._safe_cancel(second_id)
         self._handle_orphan(ticker, first_side, first_price, count, now,
-                            expiry_window, strike_price)
+                            expiry_window, strike_price, taker_fee)
 
     # ------------------------------------------------------------------
     # Orphan recovery — exit the filled leg immediately
@@ -392,10 +498,10 @@ class ArbBot:
 
     def _handle_orphan(self, ticker: str, filled_side: str, fill_price: int,
                        count: int, now: str,
-                       expiry_window: str = "", strike_price: float = 0.0):
+                       expiry_window: str = "", strike_price: float = 0.0,
+                       taker_fee: float = 0.07):
         """Exit the orphaned position by selling at best bid."""
         self.results.append(False)
-        fee_per_leg = config.FEE_RATE * 100
 
         # Fetch current book to get best bid for our side
         try:
@@ -455,7 +561,7 @@ class ArbBot:
                         orphaned=True,
                         exit_price=exit_price,
                         realized_pnl=float(realized_pnl * count),
-                        fees=fee_per_leg,
+                        fees=_maker_fee(fill_price, taker_fee),
                     )
                 except Exception:
                     logger.warning("db_logger.log_trade failed", exc_info=True)

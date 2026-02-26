@@ -159,6 +159,91 @@ def get_maker_summary(window_seconds=1800):
         conn.close()
 
 
+def update_arb_stability(expiry_window, current_arbs, series_ticker=""):
+    """Track arb persistence. Call each scan with the set of currently-visible arbs.
+
+    current_arbs: list of dicts with keys: strike_low, strike_high, combined_cost, depth_thin_side
+    """
+    now = time.time()
+    conn = db.get_connection()
+    try:
+        # Get all open arbs for this expiry
+        open_rows = conn.execute(
+            "SELECT id, strike_low, strike_high FROM arb_stability "
+            "WHERE expiry_window = ? AND series_ticker = ? AND status = 'open'",
+            (expiry_window, series_ticker),
+        ).fetchall()
+
+        open_map = {}
+        for r in open_rows:
+            key = (r["strike_low"], r["strike_high"])
+            open_map[key] = r["id"]
+
+        # Current arb keys
+        current_keys = set()
+        for arb in current_arbs:
+            key = (arb["strike_low"], arb["strike_high"])
+            current_keys.add(key)
+
+            if key in open_map:
+                # Update existing: increment scan_count, update cost/depth
+                conn.execute(
+                    "UPDATE arb_stability SET timestamp = ?, scan_count = scan_count + 1, "
+                    "combined_cost = ?, depth_thin_side = ? WHERE id = ?",
+                    (now, arb["combined_cost"], arb.get("depth_thin_side"), open_map[key]),
+                )
+            else:
+                # New arb
+                conn.execute(
+                    "INSERT INTO arb_stability "
+                    "(timestamp, series_ticker, expiry_window, strike_low, strike_high, "
+                    "combined_cost, depth_thin_side, first_seen, scan_count, status) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'open')",
+                    (now, series_ticker, expiry_window, arb["strike_low"], arb["strike_high"],
+                     arb["combined_cost"], arb.get("depth_thin_side"), now),
+                )
+
+        # Close arbs that are no longer visible
+        for key, row_id in open_map.items():
+            if key not in current_keys:
+                conn.execute(
+                    "UPDATE arb_stability SET status = 'closed', close_reason = 'spread_closed', "
+                    "timestamp = ? WHERE id = ?",
+                    (now, row_id),
+                )
+
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_stability_summary(window_seconds=1800):
+    """Return stability summary for recently closed arbs."""
+    conn = db.get_connection(readonly=True)
+    try:
+        cutoff = time.time() - window_seconds
+        rows = conn.execute(
+            "SELECT series_ticker, scan_count, "
+            "timestamp - first_seen AS duration_seconds, close_reason "
+            "FROM arb_stability WHERE timestamp >= ? AND status = 'closed'",
+            (cutoff,),
+        ).fetchall()
+
+        if not rows:
+            return None
+
+        total = len(rows)
+        avg_scans = sum(r["scan_count"] for r in rows) / total
+        avg_duration = sum(r["duration_seconds"] for r in rows) / total
+        return {
+            "total_closed": total,
+            "avg_scan_count": avg_scans,
+            "avg_duration_seconds": avg_duration,
+        }
+    finally:
+        conn.close()
+
+
 def log_trade(expiry_window, opp_type, strike_low, strike_high,
               leg1_side, leg1_price, leg1_fill_status,
               leg2_side=None, leg2_price=None, leg2_fill_status=None,

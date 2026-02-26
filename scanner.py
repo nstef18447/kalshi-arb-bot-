@@ -46,11 +46,11 @@ class TradeOpportunity:
 # ------------------------------------------------------------------
 
 def build_ladder(markets: list[dict]) -> dict[str, LadderSnapshot]:
-    """Group markets by expiry window, fetch orderbooks, return sorted ladders."""
-    # Group by expiry
+    """Group markets by close_time (when trading stops), fetch orderbooks, return sorted ladders."""
+    # Group by close_time (not latest_expiration_time, which is settlement date ~1 week later)
     by_expiry: dict[str, list[dict]] = {}
     for m in markets:
-        expiry = m.get("latest_expiration_time", "")
+        expiry = m.get("close_time") or m.get("latest_expiration_time", "")
         if not expiry:
             continue
         by_expiry.setdefault(expiry, []).append(m)
@@ -377,14 +377,14 @@ def log_ladder(snapshot: LadderSnapshot, opportunities: list[TradeOpportunity],
         parts.extend(stale_parts)
 
     if parts:
-        logger.info("Violations: %s", ", ".join(parts))
+        logger.info("[%s] Violations: %s", series_ticker, ", ".join(parts))
     else:
-        logger.info("No violations detected")
+        logger.info("[%s] No violations detected", series_ticker)
 
     # Top 3 opportunities
     for i, opp in enumerate(opportunities[:3]):
         logger.info(
-            "  #%d %s strikes=%s profit=%d net=%.1f conf=%.2f",
-            i + 1, opp.type, opp.strikes, opp.profit_cents,
+            "[%s]   #%d %s strikes=%s profit=%d net=%.1f conf=%.2f",
+            series_ticker, i + 1, opp.type, opp.strikes, opp.profit_cents,
             opp.net_profit_cents, opp.confidence,
         )

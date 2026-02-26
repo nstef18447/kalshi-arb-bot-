@@ -34,6 +34,30 @@ def validate_env():
 
 def print_config():
     env = os.getenv("KALSHI_ENV", "demo").upper()
+
+    if config.MODE == "market_maker":
+        import mm_config as mc
+        print(f"\n{'='*50}")
+        print(f"  Kalshi Market Maker — {env}")
+        print(f"{'='*50}")
+        print(f"  Series:          {mc.MM_SERIES}")
+        print(f"  Half spread:     {mc.MM_HALF_SPREAD}c")
+        print(f"  Quote size:      {mc.MM_QUOTE_SIZE}")
+        print(f"  Max inventory:   {mc.MM_MAX_INVENTORY}")
+        print(f"  Max loss:        {mc.MM_MAX_LOSS}c (${mc.MM_MAX_LOSS/100:.2f})")
+        print(f"  Strikes:         {mc.MM_STRIKES}")
+        print(f"  Requote interval:{mc.MM_REQUOTE_INTERVAL}s")
+        print(f"  TTL window:      {mc.MM_MIN_EXPIRY}s — {mc.MM_MAX_EXPIRY}s")
+        print(f"  Quote tolerance: {mc.MM_QUOTE_TOLERANCE}c")
+        print(f"  Min book spread: {mc.MM_MIN_BOOK_SPREAD}c")
+        print(f"  Max API errors:  {mc.MM_MAX_API_ERRORS}")
+        if mc.MM_CONFIRM:
+            print(f"\n  MODE: LIVE QUOTING")
+        else:
+            print(f"\n  MODE: DRY RUN (no orders placed)")
+        print(f"{'='*50}\n")
+        return
+
     print(f"\n{'='*50}")
     print(f"  Kalshi Arb Bot — {env} MODE")
     print(f"{'='*50}")
@@ -79,14 +103,25 @@ def main():
         print("  Check your API credentials and try again.")
         sys.exit(1)
 
-    bot = ArbBot()
-    try:
-        bot.start()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        bot.stop()
-        print("\nBot shut down cleanly.")
+    if config.MODE == "market_maker":
+        from mm_engine import MarketMaker
+        mm = MarketMaker()
+        try:
+            mm.start()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            mm.stop()
+            print("\nMarket maker shut down cleanly.")
+    else:
+        bot = ArbBot()
+        try:
+            bot.start()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            bot.stop()
+            print("\nBot shut down cleanly.")
 
 
 if __name__ == "__main__":

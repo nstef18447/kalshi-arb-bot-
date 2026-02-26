@@ -1,7 +1,8 @@
 import os
 
 # --- Mode ---
-READ_ONLY = os.getenv("READ_ONLY", "true").lower() in ("true", "1", "yes")
+MODE = os.getenv("MODE", "read_only").lower()
+READ_ONLY = MODE not in ("arb", "market_maker")
 
 ARB_THRESHOLD = 95          # Max combined price in cents to trigger arb
 MAX_CONTRACTS = 25          # Contracts per leg
@@ -11,12 +12,18 @@ MAX_EXPOSURE = 50000_00     # Max deployed capital in cents ($50,000)
 # --- Series to monitor (ticker -> fee config) ---
 # taker_fee: flat rate applied to payout (e.g. 0.07 = 7%)
 # maker_mult: multiplier in maker fee formula: mult * P * (1-P)
+# contract_type: "above_below" = arb logic valid, "range" = monitoring only
 SERIES = {
-    "KXBTC":        {"taker_fee": 0.07,  "maker_mult": 0.0175},
-    "KXETH":        {"taker_fee": 0.07,  "maker_mult": 0.0175},
-    "KXSOLE":       {"taker_fee": 0.07,  "maker_mult": 0.0175},
-    "KXINXU":       {"taker_fee": 0.035, "maker_mult": 0.00875},
-    "KXNASDAQ100U": {"taker_fee": 0.035, "maker_mult": 0.00875},
+    # Above/below contracts — cross-strike arb logic is valid
+    "KXBTCD":       {"taker_fee": 0.07,  "maker_mult": 0.0175, "poll_every": 1, "contract_type": "above_below"},
+    "KXETHD":       {"taker_fee": 0.07,  "maker_mult": 0.0175, "poll_every": 1, "contract_type": "above_below"},
+    "KXSOLD":       {"taker_fee": 0.07,  "maker_mult": 0.0175, "poll_every": 1, "contract_type": "above_below"},
+    "KXINXU":       {"taker_fee": 0.035, "maker_mult": 0.00875, "poll_every": 6, "contract_type": "above_below"},
+    "KXNASDAQ100U": {"taker_fee": 0.035, "maker_mult": 0.00875, "poll_every": 6, "contract_type": "above_below"},
+    # Range contracts — arb logic does NOT apply, monitoring only
+    "KXBTC":        {"taker_fee": 0.07,  "maker_mult": 0.0175, "poll_every": 6, "contract_type": "range"},
+    "KXETH":        {"taker_fee": 0.07,  "maker_mult": 0.0175, "poll_every": 6, "contract_type": "range"},
+    "KXSOLE":       {"taker_fee": 0.07,  "maker_mult": 0.0175, "poll_every": 6, "contract_type": "range"},
 }
 
 # --- Execution tuning ---
