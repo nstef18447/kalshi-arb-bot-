@@ -70,7 +70,7 @@ class MarketMaker:
         self.contract_type = config.SERIES.get(self.series, {}).get("contract_type", "above_below")
         self.poll_interval = mc.MM_POLL_OVERRIDES.get(series, mc.MM_REQUOTE_INTERVAL)
         self._halt_event = halt_event or threading.Event()
-        self.quote_size = self.quote_size_OVERRIDES.get(series, self.quote_size)
+        self.quote_size = mc.MM_QUOTE_SIZE_OVERRIDES.get(series, mc.MM_QUOTE_SIZE)
 
         self.running = False
         self._stopped = False
