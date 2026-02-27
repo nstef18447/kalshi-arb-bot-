@@ -586,8 +586,8 @@ class MarketMaker:
             logger.exception("[%s] Could not fetch markets", self.series)
             return
 
-        # Filter to open markets only
-        open_markets = [m for m in markets if m.get("status", "") == "open"]
+        # Filter to open/active markets only
+        open_markets = [m for m in markets if m.get("status", "") in ("open", "active")]
 
         if not open_markets:
             # Window gap — no active market
