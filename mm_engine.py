@@ -14,6 +14,8 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 
+import requests
+
 import config
 import mm_config as mc
 import mm_logger
@@ -90,9 +92,25 @@ class MarketMaker:
 
         # Volatility tracking (rolling midprice history)
         self.mid_history: deque = deque(maxlen=max(mc.MM_VOL_WINDOW, mc.MM_VOL_PAUSE_LOOKBACK) + 1)
-        self.current_half_spread = mc.MM_BASE_HALF_SPREAD
+        self.base_half_spread = mc.MM_BASE_HALF_SPREAD_OVERRIDES.get(series, mc.MM_BASE_HALF_SPREAD)
+        self.current_half_spread = self.base_half_spread
         self.ema_vol = 0.0  # EMA-smoothed volatility
         self.vol_paused = False
+
+        # BTC spot price monitor (binary series only)
+        self.btc_prices: deque = deque(maxlen=60)  # (timestamp, price) — last ~60s
+        self.btc_spot_paused = False
+        self._btc_spot_pause_until = 0.0
+        self._btc_thread: threading.Thread | None = None
+
+        # One-sided fill detector (binary series only)
+        self.consecutive_fill_side: str = ""  # "bid" or "ask"
+        self.consecutive_fill_count: int = 0
+        self.onesided_paused = False
+        self._onesided_pause_until = 0.0
+
+        # Window start buffer
+        self._window_open_ts: float = 0.0  # when current binary window was first seen
 
         # ATM strike tracking (for vol pause % check and midprice sampling)
         self.atm_ticker = ""
@@ -119,6 +137,12 @@ class MarketMaker:
 
         self._startup_checks()
         self.running = True
+
+        # Start BTC spot monitor for binary series
+        if self.contract_type == "binary":
+            self._btc_thread = threading.Thread(
+                target=self._btc_spot_monitor, name=f"btc-spot-{self.series}", daemon=True)
+            self._btc_thread.start()
         logger.info("[%s] Market maker started — dry_run=%s, poll=%ds",
                     self.series, not mc.MM_CONFIRM, self.poll_interval)
 
@@ -151,6 +175,108 @@ class MarketMaker:
     def _signal_handler(self, signum, frame):
         logger.info("Signal %s received — shutting down", signum)
         self.running = False
+
+    # ------------------------------------------------------------------
+    # BTC spot price monitor
+    # ------------------------------------------------------------------
+
+    def _btc_spot_monitor(self):
+        """Background thread: poll BTC price every ~1s, detect fast moves."""
+        while self.running and not self._halt_event.is_set():
+            try:
+                resp = requests.get(
+                    "https://api.coinbase.com/v2/prices/BTC-USD/spot",
+                    timeout=3,
+                )
+                if resp.status_code == 200:
+                    price = float(resp.json()["data"]["amount"])
+                    self.btc_prices.append((time.time(), price))
+            except Exception:
+                pass  # non-critical, skip this tick
+            time.sleep(1)
+
+    def _check_btc_spot_pause(self, now: float) -> bool:
+        """Check if BTC spot moved enough to trigger a pause.
+
+        Returns True if we should skip this cycle (paused or newly pausing).
+        """
+        # Check if we're still in an existing pause
+        if self.btc_spot_paused:
+            if now < self._btc_spot_pause_until:
+                remaining = self._btc_spot_pause_until - now
+                print(f"[MM] BTC SPOT PAUSE: {remaining:.0f}s remaining")
+                return True
+            self.btc_spot_paused = False
+            logger.info("[%s] BTC spot pause ended, resuming", self.series)
+
+        if len(self.btc_prices) < 3:
+            return False
+
+        # Check for >0.15% move in any 10s window within last 30s of data
+        cutoff = now - 30
+        recent = [(t, p) for t, p in self.btc_prices if t >= cutoff]
+        if len(recent) < 2:
+            return False
+
+        lookback = mc.MM_BTC_SPOT_LOOKBACK  # 10s default
+        for i in range(len(recent) - 1, -1, -1):
+            t_new, p_new = recent[i]
+            for j in range(i - 1, -1, -1):
+                t_old, p_old = recent[j]
+                if t_new - t_old > lookback:
+                    break
+                move_pct = abs(p_new - p_old) / p_old
+                if move_pct >= mc.MM_BTC_SPOT_MOVE_PCT:
+                    self.btc_spot_paused = True
+                    self._btc_spot_pause_until = now + mc.MM_BTC_SPOT_PAUSE
+                    self._cancel_all()
+                    logger.info("[%s] BTC SPOT PAUSE: %.2f%% move ($%.0f→$%.0f) in %.0fs — "
+                                "pausing %ds", self.series, move_pct * 100,
+                                p_old, p_new, t_new - t_old, mc.MM_BTC_SPOT_PAUSE)
+                    print(f"[MM] BTC SPOT PAUSE: {move_pct:.2%} move — quotes pulled for {mc.MM_BTC_SPOT_PAUSE}s")
+                    return True
+
+        return False
+
+    # ------------------------------------------------------------------
+    # One-sided fill detector
+    # ------------------------------------------------------------------
+
+    def _record_fill_side(self, side: str):
+        """Track consecutive same-side fills for adverse selection detection."""
+        if side == self.consecutive_fill_side:
+            self.consecutive_fill_count += 1
+        else:
+            self.consecutive_fill_side = side
+            self.consecutive_fill_count = 1
+
+    def _check_onesided_pause(self, now: float) -> bool:
+        """Check if one-sided fills should trigger a pause.
+
+        Returns True if we should skip this cycle.
+        """
+        if self.onesided_paused:
+            if now < self._onesided_pause_until:
+                remaining = self._onesided_pause_until - now
+                print(f"[MM] ONE-SIDED PAUSE: {remaining:.0f}s remaining")
+                return True
+            self.onesided_paused = False
+            self.consecutive_fill_count = 0
+            self.consecutive_fill_side = ""
+            logger.info("[%s] One-sided fill pause ended, resuming", self.series)
+
+        if self.consecutive_fill_count >= mc.MM_ONESIDED_FILL_LIMIT:
+            self.onesided_paused = True
+            self._onesided_pause_until = now + mc.MM_ONESIDED_PAUSE
+            self._cancel_all()
+            logger.info("[%s] ONE-SIDED PAUSE: %d consecutive %s fills — pausing %ds",
+                        self.series, self.consecutive_fill_count,
+                        self.consecutive_fill_side, mc.MM_ONESIDED_PAUSE)
+            print(f"[MM] ONE-SIDED PAUSE: {self.consecutive_fill_count} consecutive "
+                  f"{self.consecutive_fill_side} fills — pausing {mc.MM_ONESIDED_PAUSE}s")
+            return True
+
+        return False
 
     # ------------------------------------------------------------------
     # Startup
@@ -359,6 +485,27 @@ class MarketMaker:
                                     self.series, ttl, active_st.inventory)
                     return  # skip entire cycle — no quoting in final minutes
 
+                # --- Window start buffer: don't quote until window has been open long enough ---
+                window_age = 0.0
+                if self._window_open_ts > 0 and active_st.close_ts > 0:
+                    # Window duration = close_ts - open_ts; open_ts = close_ts - 900 (15m)
+                    window_age = now - self._window_open_ts
+                if window_age < mc.MM_MIN_TTL_START_SECONDS:
+                    if active_st.bid_order_id or active_st.ask_order_id:
+                        self._cancel_if_active(active_st, "bid")
+                        self._cancel_if_active(active_st, "ask")
+                    remaining = mc.MM_MIN_TTL_START_SECONDS - window_age
+                    print(f"[MM] WINDOW START BUFFER: {remaining:.0f}s until quoting begins")
+                    return
+
+            # --- BTC spot price pause ---
+            if self._check_btc_spot_pause(now):
+                return
+
+            # --- One-sided fill pause ---
+            if self._check_onesided_pause(now):
+                return
+
         # --- Volatility tracking: record current midprice + ATM strike ---
         sample_mid = self._sample_midprice()
         if sample_mid is not None:
@@ -474,12 +621,12 @@ class MarketMaker:
         """
         # Need at least 10 observations for meaningful stdev
         if len(self.mid_history) < 10:
-            return mc.MM_BASE_HALF_SPREAD
+            return self.base_half_spread
 
         # Get the last VOL_WINDOW observations
         recent = list(self.mid_history)[-mc.MM_VOL_WINDOW:]
         if len(recent) < 10:
-            return mc.MM_BASE_HALF_SPREAD
+            return self.base_half_spread
 
         # Calculate stdev of price changes (mid[t] - mid[t-1])
         changes = [recent[i][1] - recent[i-1][1] for i in range(1, len(recent))]
@@ -487,7 +634,7 @@ class MarketMaker:
         try:
             raw_vol = statistics.stdev(changes) if len(changes) >= 2 else abs(changes[0])
         except statistics.StatisticsError:
-            return mc.MM_BASE_HALF_SPREAD
+            return self.base_half_spread
 
         # EMA smoothing to reduce jitter
         alpha = mc.MM_VOL_EMA_ALPHA
@@ -497,7 +644,7 @@ class MarketMaker:
             self.ema_vol = alpha * raw_vol + (1 - alpha) * self.ema_vol
 
         # Conservative rounding — wider is safer than tighter
-        dynamic = max(mc.MM_BASE_HALF_SPREAD,
+        dynamic = max(self.base_half_spread,
                       math.ceil(self.ema_vol * mc.MM_VOL_MULTIPLIER))
         dynamic = min(dynamic, mc.MM_MAX_HALF_SPREAD)
         return dynamic
@@ -665,6 +812,10 @@ class MarketMaker:
 
         self.atm_ticker = ticker
         self.current_atm_strike = strike
+        self._window_open_ts = time.time()  # track when we first saw this window
+        # Reset one-sided fill tracking for new window
+        self.consecutive_fill_side = ""
+        self.consecutive_fill_count = 0
         logger.info("[%s] Binary strike selected: %s (strike=%.2f, TTL=%.0fs)",
                     self.series, ticker, strike, max(0, close_ts - time.time()))
 
@@ -1298,6 +1449,10 @@ class MarketMaker:
             logger.info("FILL %s %s %dc x%d inv=%d rpnl=%.0fc",
                         st.ticker, fill_side, fill.price, new_fills,
                         st.inventory, st.realized_pnl)
+
+            # Track for one-sided fill detector (binary only)
+            if self.contract_type == "binary":
+                self._record_fill_side(side)
 
         # If order is fully filled or cancelled, clear it and reset tracking
         if status in ("filled", "cancelled"):

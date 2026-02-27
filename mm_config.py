@@ -27,8 +27,27 @@ MM_QUOTE_TOLERANCE = int(os.getenv("MM_QUOTE_TOLERANCE", "2"))
 MM_MIN_BOOK_SPREAD = int(os.getenv("MM_MIN_BOOK_SPREAD", "3"))
 MM_MAX_API_ERRORS = int(os.getenv("MM_MAX_API_ERRORS", "5"))
 
+# --- Per-series half spread overrides ---
+MM_BASE_HALF_SPREAD = int(os.getenv("MM_BASE_HALF_SPREAD", str(MM_HALF_SPREAD)))  # default half spread (cents)
+MM_BASE_HALF_SPREAD_OVERRIDES: dict[str, int] = {}
+for _s in MM_SERIES_LIST:
+    _env_val = os.getenv(f"MM_BASE_HALF_SPREAD_{_s}")
+    if _env_val is not None:
+        MM_BASE_HALF_SPREAD_OVERRIDES[_s] = int(_env_val)
+
+# --- Window start buffer (binary only) ---
+MM_MIN_TTL_START_SECONDS = int(os.getenv("MM_MIN_TTL_START_SECONDS", "120"))  # don't quote first N seconds of window
+
+# --- BTC spot price monitor ---
+MM_BTC_SPOT_MOVE_PCT = float(os.getenv("MM_BTC_SPOT_MOVE_PCT", "0.0015"))  # 0.15% move triggers pause
+MM_BTC_SPOT_LOOKBACK = int(os.getenv("MM_BTC_SPOT_LOOKBACK", "10"))  # seconds lookback for move check
+MM_BTC_SPOT_PAUSE = int(os.getenv("MM_BTC_SPOT_PAUSE", "15"))  # seconds to pause after trigger
+
+# --- One-sided fill detector ---
+MM_ONESIDED_FILL_LIMIT = int(os.getenv("MM_ONESIDED_FILL_LIMIT", "2"))  # consecutive same-side fills before pause
+MM_ONESIDED_PAUSE = int(os.getenv("MM_ONESIDED_PAUSE", "30"))  # seconds to pause after trigger
+
 # --- Volatility-adaptive spread ---
-MM_BASE_HALF_SPREAD = int(os.getenv("MM_BASE_HALF_SPREAD", str(MM_HALF_SPREAD)))  # minimum half spread (cents)
 MM_VOL_MULTIPLIER = float(os.getenv("MM_VOL_MULTIPLIER", "2.0"))
 MM_MAX_HALF_SPREAD = int(os.getenv("MM_MAX_HALF_SPREAD", "15"))
 MM_VOL_WINDOW = int(os.getenv("MM_VOL_WINDOW", "60"))  # scans (60 * 5s = 5 min)

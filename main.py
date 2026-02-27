@@ -49,7 +49,10 @@ def print_config():
             poll = mc.MM_POLL_OVERRIDES.get(s, mc.MM_REQUOTE_INTERVAL)
             ctype = config.SERIES.get(s, {}).get("contract_type", "?")
             print(f"  Series:          {s} ({ctype}, poll={poll}s)")
-        print(f"  Base half spread:{mc.MM_BASE_HALF_SPREAD}c (dynamic: {mc.MM_BASE_HALF_SPREAD*2}-{mc.MM_MAX_HALF_SPREAD*2}c)")
+        for s in mc.MM_SERIES_LIST:
+            hs = mc.MM_BASE_HALF_SPREAD_OVERRIDES.get(s, mc.MM_BASE_HALF_SPREAD)
+            print(f"  Half spread {s}: {hs}c (spread={hs*2}c)")
+        print(f"  Dynamic range:   {mc.MM_BASE_HALF_SPREAD*2}-{mc.MM_MAX_HALF_SPREAD*2}c")
         print(f"  Vol multiplier:  {mc.MM_VOL_MULTIPLIER}x (EMA alpha={mc.MM_VOL_EMA_ALPHA})")
         print(f"  Vol window:      {mc.MM_VOL_WINDOW} scans ({mc.MM_VOL_WINDOW * mc.MM_REQUOTE_INTERVAL}s)")
         print(f"  Vol pause:       {mc.MM_VOL_PAUSE_THRESHOLD:.1%} ATM strike move OR {mc.MM_MID_MOVE_PAUSE}c mid move in {mc.MM_VOL_PAUSE_LOOKBACK * mc.MM_REQUOTE_INTERVAL}s")
@@ -66,6 +69,10 @@ def print_config():
         print(f"  Quote tolerance: {mc.MM_QUOTE_TOLERANCE}c")
         print(f"  Min book spread: {mc.MM_MIN_BOOK_SPREAD}c")
         print(f"  Max API errors:  {mc.MM_MAX_API_ERRORS}")
+        print(f"  TTL cutoff:      {mc.MM_MIN_TTL_SECONDS}s (binary end)")
+        print(f"  Window buffer:   {mc.MM_MIN_TTL_START_SECONDS}s (binary start)")
+        print(f"  BTC spot pause:  {mc.MM_BTC_SPOT_MOVE_PCT:.2%} in {mc.MM_BTC_SPOT_LOOKBACK}s → {mc.MM_BTC_SPOT_PAUSE}s pause")
+        print(f"  One-sided fills: {mc.MM_ONESIDED_FILL_LIMIT} consecutive → {mc.MM_ONESIDED_PAUSE}s pause")
         if mc.MM_CONFIRM:
             print(f"\n  MODE: LIVE QUOTING")
         else:
