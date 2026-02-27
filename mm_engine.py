@@ -342,26 +342,22 @@ class MarketMaker:
             logger.warning("No strikes selected — skipping cycle")
             return
 
-        # --- Binary TTL cutoff: stop quoting near expiry ---
+        # --- Binary TTL cutoff: stop ALL quoting near expiry ---
         if self.contract_type == "binary":
             now_ttl = time.time()
             active_st = self.strikes.get(self.atm_ticker)
-            if active_st and active_st.close_ts > 0 and not active_st.exit_only:
+            if active_st and active_st.close_ts > 0:
                 ttl = active_st.close_ts - now_ttl
-                if ttl < mc.MM_MIN_TTL_SECONDS:
-                    # Cancel all orders and mark exit_only until window expires
-                    self._check_fills(active_st)
-                    self._cancel_if_active(active_st, "bid")
-                    self._cancel_if_active(active_st, "ask")
-                    if active_st.inventory != 0:
-                        active_st.exit_only = True
-                        logger.info("[%s] TTL cutoff (%.0fs left) — exit_only (inv=%d)",
+                if ttl < mc.MM_MIN_TTL_SECONDS and ttl > 0:
+                    # Cancel ALL orders — no exit orders either, let it settle
+                    if active_st.bid_order_id or active_st.ask_order_id:
+                        self._check_fills(active_st)
+                        self._cancel_if_active(active_st, "bid")
+                        self._cancel_if_active(active_st, "ask")
+                        logger.info("[%s] TTL cutoff (%.0fs left) — all orders cancelled, "
+                                    "waiting for settlement (inv=%d)",
                                     self.series, ttl, active_st.inventory)
-                    else:
-                        del self.strikes[self.atm_ticker]
-                        logger.info("[%s] TTL cutoff (%.0fs left) — cleared, waiting for next window",
-                                    self.series, ttl)
-                    return
+                    return  # skip entire cycle — no quoting in final minutes
 
         # --- Volatility tracking: record current midprice + ATM strike ---
         sample_mid = self._sample_midprice()
