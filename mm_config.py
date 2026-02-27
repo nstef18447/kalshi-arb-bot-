@@ -3,14 +3,18 @@
 import os
 
 MM_SERIES = os.getenv("MM_SERIES", "KXBTCD")
+MM_SERIES_LIST = [s.strip() for s in os.getenv("MM_SERIES_LIST", MM_SERIES).split(",")]
+MM_POLL_OVERRIDES = {"KXBTCD": 5, "KXBTC15M": 1}  # seconds between poll cycles per series
 MM_HALF_SPREAD = int(os.getenv("MM_HALF_SPREAD", "5"))
 MM_QUOTE_SIZE = int(os.getenv("MM_QUOTE_SIZE", "5"))
 MM_MAX_INVENTORY = int(os.getenv("MM_MAX_INVENTORY", "5"))
 MM_MAX_LOSS = int(os.getenv("MM_MAX_LOSS", "2500"))          # cents ($25)
 MM_STRIKES = os.getenv("MM_STRIKES", "auto").lower()
 MM_REQUOTE_INTERVAL = int(os.getenv("MM_REQUOTE_INTERVAL", "5"))
-MM_MIN_EXPIRY = int(os.getenv("MM_MIN_EXPIRY", "3600"))      # 1 hour
-MM_MAX_EXPIRY = int(os.getenv("MM_MAX_EXPIRY", "172800"))    # 48 hours
+MM_MIN_EXPIRY = int(os.getenv("MM_MIN_EXPIRY", "600"))        # 10 minutes (hourly events close fast)
+MM_HOURLY_MAX_TTL = int(os.getenv("MM_HOURLY_MAX_TTL", "7200"))    # 2h — events shorter than this are "hourly"
+MM_DAILY_MAX_TTL = int(os.getenv("MM_DAILY_MAX_TTL", "93600"))     # 26h — events shorter than this are "daily"
+MM_QUOTE_WEEKLY = os.getenv("MM_QUOTE_WEEKLY", "false").lower() in ("true", "1", "yes")
 MM_CONFIRM = os.getenv("MM_CONFIRM", "false").lower() in ("true", "1", "yes")
 MM_QUOTE_TOLERANCE = int(os.getenv("MM_QUOTE_TOLERANCE", "2"))
 MM_MIN_BOOK_SPREAD = int(os.getenv("MM_MIN_BOOK_SPREAD", "3"))

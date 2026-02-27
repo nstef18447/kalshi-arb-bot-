@@ -1,6 +1,8 @@
 import os
+import signal
 import sys
 import logging
+import threading
 
 from dotenv import load_dotenv
 
@@ -43,7 +45,10 @@ def print_config():
         print(f"\n{'='*50}")
         print(f"  Kalshi Market Maker — {env}")
         print(f"{'='*50}")
-        print(f"  Series:          {mc.MM_SERIES}")
+        for s in mc.MM_SERIES_LIST:
+            poll = mc.MM_POLL_OVERRIDES.get(s, mc.MM_REQUOTE_INTERVAL)
+            ctype = config.SERIES.get(s, {}).get("contract_type", "?")
+            print(f"  Series:          {s} ({ctype}, poll={poll}s)")
         print(f"  Base half spread:{mc.MM_BASE_HALF_SPREAD}c (dynamic: {mc.MM_BASE_HALF_SPREAD*2}-{mc.MM_MAX_HALF_SPREAD*2}c)")
         print(f"  Vol multiplier:  {mc.MM_VOL_MULTIPLIER}x (EMA alpha={mc.MM_VOL_EMA_ALPHA})")
         print(f"  Vol window:      {mc.MM_VOL_WINDOW} scans ({mc.MM_VOL_WINDOW * mc.MM_REQUOTE_INTERVAL}s)")
@@ -133,15 +138,45 @@ def main():
             sys.exit(1)
 
     if config.MODE == "market_maker":
+        import mm_config as mc
         from mm_engine import MarketMaker
-        mm = MarketMaker()
-        try:
-            mm.start()
-        except KeyboardInterrupt:
-            pass
-        finally:
-            mm.stop()
-            print("\nMarket maker shut down cleanly.")
+
+        series_list = mc.MM_SERIES_LIST
+        if len(series_list) == 1:
+            # Single series — no threading, same as before
+            mm = MarketMaker(series=series_list[0])
+            try:
+                mm.start()
+            except KeyboardInterrupt:
+                pass
+            finally:
+                mm.stop()
+                print("\nMarket maker shut down cleanly.")
+        else:
+            # Multi-series — thread per series
+            halt_event = threading.Event()
+            instances = []
+            threads = []
+            for series in series_list:
+                mm = MarketMaker(series=series, halt_event=halt_event)
+                instances.append(mm)
+                t = threading.Thread(target=mm.start, name=f"mm-{series}", daemon=True)
+                threads.append(t)
+                t.start()
+
+            # Main thread: wait for halt or keyboard interrupt
+            signal.signal(signal.SIGINT, lambda s, f: halt_event.set())
+            signal.signal(signal.SIGTERM, lambda s, f: halt_event.set())
+            try:
+                halt_event.wait()
+            except KeyboardInterrupt:
+                halt_event.set()
+
+            for mm in instances:
+                mm.running = False
+            for t in threads:
+                t.join(timeout=10)
+            print("\nAll market makers shut down cleanly.")
     elif config.MODE == "binary_arb":
         from binary_arb_bot import BinaryArbBot
         bot = BinaryArbBot()

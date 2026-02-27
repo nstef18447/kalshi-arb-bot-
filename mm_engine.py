@@ -8,6 +8,7 @@ import logging
 import math
 import signal
 import statistics
+import threading
 import time
 import uuid
 from collections import deque
@@ -28,6 +29,10 @@ from kalshi_api import (
 )
 
 logger = logging.getLogger("mm-engine")
+
+# Shared across MarketMaker instances for combined P&L circuit breaker
+_shared_pnl: dict[str, float] = {}
+_pnl_lock = threading.Lock()
 
 
 @dataclass
@@ -54,10 +59,18 @@ class StrikeState:
     yes_fills: deque = field(default_factory=deque)
     no_fills: deque = field(default_factory=deque)
     realized_pnl: float = 0.0   # cents
+    last_mid: float = 0.0       # last known midprice for exit pricing when book is empty
+    exit_only: bool = False      # True when kept solely for inventory exit (ATM moved away)
+    event_tier: str = ""         # "hourly", "daily", or "weekly"
 
 
 class MarketMaker:
-    def __init__(self):
+    def __init__(self, series: str = mc.MM_SERIES, halt_event: threading.Event | None = None):
+        self.series = series
+        self.contract_type = config.SERIES.get(self.series, {}).get("contract_type", "above_below")
+        self.poll_interval = mc.MM_POLL_OVERRIDES.get(series, mc.MM_REQUOTE_INTERVAL)
+        self._halt_event = halt_event or threading.Event()
+
         self.running = False
         self._stopped = False
         self.cycle_count = 0
@@ -69,7 +82,7 @@ class MarketMaker:
         self._starting_balance = 0
 
         # Pull fee config from config.SERIES for this series
-        series_cfg = config.SERIES.get(mc.MM_SERIES, {})
+        series_cfg = config.SERIES.get(self.series, {})
         self.taker_fee = series_cfg.get("taker_fee", 0.07)
         self.maker_mult = series_cfg.get("maker_mult", 0.0175)
 
@@ -98,27 +111,29 @@ class MarketMaker:
     # ------------------------------------------------------------------
 
     def start(self):
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
+        if threading.current_thread() is threading.main_thread():
+            signal.signal(signal.SIGINT, self._signal_handler)
+            signal.signal(signal.SIGTERM, self._signal_handler)
 
         self._startup_checks()
         self.running = True
-        logger.info("Market maker started — dry_run=%s", not mc.MM_CONFIRM)
+        logger.info("[%s] Market maker started — dry_run=%s, poll=%ds",
+                    self.series, not mc.MM_CONFIRM, self.poll_interval)
 
-        while self.running and not self.halted:
+        while self.running and not self.halted and not self._halt_event.is_set():
             try:
                 self._cycle()
                 self.consecutive_errors = 0
             except Exception:
                 self.consecutive_errors += 1
-                logger.exception("Cycle error (%d/%d)",
-                                 self.consecutive_errors, mc.MM_MAX_API_ERRORS)
+                logger.exception("[%s] Cycle error (%d/%d)",
+                                 self.series, self.consecutive_errors, mc.MM_MAX_API_ERRORS)
                 if self.consecutive_errors >= mc.MM_MAX_API_ERRORS:
-                    logger.error("Too many consecutive errors — halting")
+                    logger.error("[%s] Too many consecutive errors — halting", self.series)
                     self.halted = True
                     break
 
-            time.sleep(mc.MM_REQUOTE_INTERVAL)
+            time.sleep(self.poll_interval)
 
         self.stop()
 
@@ -146,14 +161,6 @@ class MarketMaker:
         except Exception:
             logger.exception("Could not fetch balance")
 
-        try:
-            positions = get_positions()
-            if positions:
-                tickers = [p.get("ticker", "?") for p in positions]
-                logger.warning("Existing positions detected: %s", tickers)
-        except Exception:
-            logger.exception("Could not fetch positions")
-
         # Cancel any stale orders from a previous session
         try:
             open_orders = get_open_orders()
@@ -172,6 +179,149 @@ class MarketMaker:
         except Exception:
             logger.exception("Could not fetch open orders")
 
+        # Reconcile existing positions — adopt any stranded inventory from
+        # previous sessions so we can manage/exit them properly.
+        self._reconcile_positions()
+
+        # Scan available events by duration tier
+        self._print_available_events()
+
+    def _reconcile_positions(self):
+        """Sync internal state with Kalshi positions API.
+
+        If we find positions on tickers we're not tracking, create StrikeState
+        entries so the engine can quote to exit them instead of leaving them
+        stranded.
+        """
+        try:
+            positions = get_positions()
+        except Exception:
+            logger.exception("Could not fetch positions for reconciliation")
+            return
+
+        if not positions:
+            logger.info("No existing positions — clean start")
+            return
+
+        for pos in positions:
+            ticker = pos.get("ticker", "")
+            if not ticker or not ticker.startswith(self.series):
+                continue
+
+            # Kalshi positions: market_position has 'yes' and 'no' counts
+            yes_count = pos.get("position", 0)
+            # Also check alternative field names
+            if yes_count == 0:
+                yes_count = pos.get("total_traded", 0)
+
+            # The 'position' field gives net position: positive = long yes
+            net_position = pos.get("position", 0)
+            if net_position == 0:
+                continue
+
+            if ticker in self.strikes:
+                # Already tracking — update inventory if it doesn't match
+                st = self.strikes[ticker]
+                if st.inventory != net_position:
+                    logger.warning("RECONCILE %s: internal inv=%d, Kalshi pos=%d — updating",
+                                   ticker, st.inventory, net_position)
+                    st.inventory = net_position
+            else:
+                # Stranded position — create a StrikeState to track it
+                strike = self._parse_strike_from_ticker(ticker)
+                st = StrikeState(ticker=ticker, strike=strike, inventory=net_position)
+                self.strikes[ticker] = st
+                logger.warning("RECONCILE %s: adopted stranded position inv=%d strike=%.2f",
+                               ticker, net_position, strike)
+
+    def _parse_strike_from_ticker(self, ticker: str) -> float:
+        """Extract strike value from ticker.
+
+        KXBTCD format:    KXBTCD-26FEB2717-T68499.99 → parse after -T
+        KXBTC15M format:  KXBTC15M-26FEB261800-00 → no strike in ticker, return 0
+        (binary tickers use floor_strike from market data via _parse_strike instead)
+        """
+        import re
+        match = re.search(r"-T([\d.]+)$", ticker)
+        if match:
+            try:
+                return float(match.group(1))
+            except ValueError:
+                pass
+        return 0.0
+
+    def _print_available_events(self):
+        """Print available events by duration tier with spread info on startup."""
+        try:
+            markets = get_markets(self.series)
+        except Exception:
+            logger.exception("Could not fetch markets for event scan")
+            return
+
+        now = time.time()
+
+        # Group by event and compute TTLs
+        by_event = {}
+        for m in markets:
+            close_time = m.get("close_time") or m.get("expiration_time", "")
+            if not close_time:
+                continue
+            try:
+                from datetime import datetime, timezone
+                if isinstance(close_time, str):
+                    ct = close_time.replace("Z", "+00:00")
+                    exp_ts = datetime.fromisoformat(ct).timestamp()
+                else:
+                    exp_ts = float(close_time)
+            except (ValueError, TypeError):
+                continue
+
+            ttl = exp_ts - now
+            if ttl < mc.MM_MIN_EXPIRY:
+                continue
+            m["_ttl"] = ttl
+            evt = m.get("event_ticker", "")
+            by_event.setdefault(evt, []).append(m)
+
+        if not by_event:
+            print("  No events found above min TTL")
+            return
+
+        print(f"\n  AVAILABLE EVENTS ({self.series}):")
+        print(f"  {'Event':<35} {'TTL':>8} {'Tier':<8} {'Strikes':>7} {'Spread':>7}")
+        print(f"  {'-'*35} {'-'*8} {'-'*8} {'-'*7} {'-'*7}")
+
+        for evt in sorted(by_event.keys(), key=lambda e: by_event[e][0]["_ttl"]):
+            evt_markets = by_event[evt]
+            ttl = evt_markets[0]["_ttl"]
+            tier = self._classify_event_tier(ttl)
+            n_strikes = len(evt_markets)
+
+            # Probe ATM spread for one strike near the middle
+            spread_str = "?"
+            middle = evt_markets[len(evt_markets) // 2]
+            try:
+                book = get_orderbook(middle.get("ticker", ""), depth=1)
+                yb = self._best_bid(book.get("yes", []))
+                nb = self._best_bid(book.get("no", []))
+                if yb is not None and nb is not None:
+                    spread_str = f"{(100 - nb) - yb}c"
+            except Exception:
+                pass
+
+            # Format TTL nicely
+            if ttl < 3600:
+                ttl_str = f"{ttl/60:.0f}m"
+            elif ttl < 86400:
+                ttl_str = f"{ttl/3600:.1f}h"
+            else:
+                ttl_str = f"{ttl/86400:.1f}d"
+
+            quotable = "Y" if tier != "weekly" or mc.MM_QUOTE_WEEKLY else "exit"
+            print(f"  {evt:<35} {ttl_str:>8} {tier:<8} {n_strikes:>7} {spread_str:>7}  [{quotable}]")
+
+        print()
+
     # ------------------------------------------------------------------
     # Main cycle
     # ------------------------------------------------------------------
@@ -180,8 +330,9 @@ class MarketMaker:
         self.cycle_count += 1
         now = time.time()
 
-        # Refresh ATM strikes every 5 minutes
-        if now - self.last_strike_refresh > 300:
+        # Refresh ATM strikes (60s for binary, 300s for ladder)
+        refresh_interval = 60 if self.contract_type == "binary" else 300
+        if now - self.last_strike_refresh > refresh_interval:
             self._select_strikes()
             self.last_strike_refresh = now
 
@@ -233,11 +384,16 @@ class MarketMaker:
             except Exception:
                 logger.exception("Error processing %s", ticker)
 
-        # Circuit breaker: max loss
+        # Circuit breaker: max loss (shared across all MM instances)
         total_rpnl = sum(s.realized_pnl for s in self.strikes.values())
-        if total_rpnl < -mc.MM_MAX_LOSS:
-            logger.error("MAX_LOSS breaker: rpnl=%.0fc — halting", total_rpnl)
+        with _pnl_lock:
+            _shared_pnl[self.series] = total_rpnl
+            combined_rpnl = sum(_shared_pnl.values())
+        if combined_rpnl < -mc.MM_MAX_LOSS:
+            logger.error("[%s] MAX_LOSS breaker: combined_rpnl=%.0fc — halting all",
+                         self.series, combined_rpnl)
             self.halted = True
+            self._halt_event.set()
             return
 
         # Log snapshot
@@ -251,7 +407,7 @@ class MarketMaker:
             elif abs(st.inventory) >= mc.MM_MAX_INVENTORY:
                 status = "INV_LIMIT"
             upnl = self._estimate_upnl(st)
-            print(f"[MM] {mc.MM_SERIES} {st.strike}: "
+            print(f"[MM] {self.series} {st.strike}: "
                   f"bid={st.bid_price} ask={st.ask_price} "
                   f"spread={self.current_half_spread*2}c "
                   f"inv={st.inventory:+d} rpnl={st.realized_pnl:+.0f}c "
@@ -372,7 +528,7 @@ class MarketMaker:
         Requires: minimum pause duration elapsed, AND fresh post-pause
         data shows volatility below thresholds.
         """
-        min_pause_seconds = mc.MM_VOL_PAUSE_LOOKBACK * mc.MM_REQUOTE_INTERVAL
+        min_pause_seconds = mc.MM_VOL_PAUSE_LOOKBACK * self.poll_interval
         if now - self._vol_pause_start < min_pause_seconds:
             return False  # haven't waited long enough
 
@@ -402,21 +558,95 @@ class MarketMaker:
     # Strike selection
     # ------------------------------------------------------------------
 
+    def _classify_event_tier(self, ttl):
+        """Classify an event by its TTL into hourly/daily/weekly."""
+        if ttl <= mc.MM_HOURLY_MAX_TTL:
+            return "hourly"
+        elif ttl <= mc.MM_DAILY_MAX_TTL:
+            return "daily"
+        else:
+            return "weekly"
+
     def _select_strikes(self):
-        markets = get_markets(mc.MM_SERIES)
+        """Dispatch to the appropriate strike selection based on contract type."""
+        if self.contract_type == "binary":
+            self._select_strikes_binary()
+        else:
+            self._select_strikes_ladder()
+
+    def _select_strikes_binary(self):
+        """Strike selection for binary contracts (KXBTC15M).
+
+        Binary series have a single open market at a time (rotating windows).
+        We track the active ticker and handle window rotation.
+        """
+        try:
+            markets = get_markets(self.series, status="open")
+        except Exception:
+            logger.exception("[%s] Could not fetch markets", self.series)
+            return
+
+        # Filter to open markets only
+        open_markets = [m for m in markets if m.get("status", "") == "open"]
+
+        if not open_markets:
+            # Window gap — no active market
+            if self.strikes:
+                logger.info("[%s] No open markets — window gap, clearing strikes", self.series)
+                for st in self.strikes.values():
+                    self._check_fills(st)
+                    self._cancel_if_active(st, "bid")
+                    self._cancel_if_active(st, "ask")
+                self.strikes.clear()
+            return
+
+        # Binary series: expect 0 or 1 open market
+        market = open_markets[0]
+        ticker = market.get("ticker", "")
+        strike = self._parse_strike(market)
+        if strike is None:
+            strike = 0.0
+
+        if ticker == self.atm_ticker and ticker in self.strikes:
+            # Same window, no change needed
+            return
+
+        # Window rotated — handle old strikes
+        if self.strikes:
+            for old_ticker, st in list(self.strikes.items()):
+                self._check_fills(st)
+                self._cancel_if_active(st, "bid")
+                self._cancel_if_active(st, "ask")
+                if st.inventory != 0:
+                    st.exit_only = True
+                    logger.info("[%s] Keeping %s as exit_only (inv=%d)",
+                                self.series, old_ticker, st.inventory)
+                else:
+                    del self.strikes[old_ticker]
+
+        # Create new StrikeState for the active ticker
+        if ticker not in self.strikes:
+            self.strikes[ticker] = StrikeState(ticker=ticker, strike=strike)
+
+        self.atm_ticker = ticker
+        self.current_atm_strike = strike
+        logger.info("[%s] Binary strike selected: %s (strike=%.2f)",
+                    self.series, ticker, strike)
+
+    def _select_strikes_ladder(self):
+        markets = get_markets(self.series)
         if not markets:
-            logger.warning("No markets found for %s", mc.MM_SERIES)
+            logger.warning("No markets found for %s", self.series)
             return
 
         now = time.time()
 
-        # Filter by TTL
+        # Parse TTL for all markets above minimum
         valid = []
         for m in markets:
             close_time = m.get("close_time") or m.get("expiration_time", "")
             if not close_time:
                 continue
-            # Parse ISO timestamp
             try:
                 from datetime import datetime, timezone
                 if isinstance(close_time, str):
@@ -428,14 +658,14 @@ class MarketMaker:
                 continue
 
             ttl = exp_ts - now
-            if mc.MM_MIN_EXPIRY <= ttl <= mc.MM_MAX_EXPIRY:
+            if ttl >= mc.MM_MIN_EXPIRY:
                 m["_ttl"] = ttl
                 m["_exp_ts"] = exp_ts
+                m["_tier"] = self._classify_event_tier(ttl)
                 valid.append(m)
 
         if not valid:
-            logger.warning("No markets in TTL window [%d, %d]s",
-                           mc.MM_MIN_EXPIRY, mc.MM_MAX_EXPIRY)
+            logger.warning("No markets with TTL >= %ds", mc.MM_MIN_EXPIRY)
             return
 
         # Group by event (expiry window)
@@ -444,26 +674,108 @@ class MarketMaker:
             evt = m.get("event_ticker", "")
             by_event.setdefault(evt, []).append(m)
 
-        # Pick event with TTL closest to midpoint
-        mid_ttl = (mc.MM_MIN_EXPIRY + mc.MM_MAX_EXPIRY) / 2
-        best_event = min(by_event.keys(),
-                         key=lambda e: abs(by_event[e][0]["_ttl"] - mid_ttl))
-        candidates = by_event[best_event]
+        # Classify events by tier using the tier of their first market
+        hourly_events = {}
+        daily_events = {}
+        weekly_events = {}
+        for evt, evt_markets in by_event.items():
+            tier = evt_markets[0]["_tier"]
+            if tier == "hourly":
+                hourly_events[evt] = evt_markets
+            elif tier == "daily":
+                daily_events[evt] = evt_markets
+            else:
+                weekly_events[evt] = evt_markets
 
-        # Extract strike values and sort
+        # Select strikes from events in priority order:
+        # 1. Hourly — always try first
+        # 2. Daily — only if fewer than 2 hourly strikes are active
+        # 3. Weekly — never open new positions (exit_only handled separately)
+        selected = []  # list of (market_dict, tier) tuples
+
+        # Try hourly events (prefer shortest TTL = closest to expiry)
+        hourly_strikes = self._pick_atm_from_events(hourly_events, prefer="shortest")
+        selected.extend((m, "hourly") for m in hourly_strikes)
+
+        # If fewer than 2 hourly strikes, add daily
+        if len(hourly_strikes) < 2:
+            daily_strikes = self._pick_atm_from_events(daily_events, prefer="midpoint")
+            selected.extend((m, "daily") for m in daily_strikes)
+
+        # Weekly: don't select for new positions (existing inventory handled below)
+
+        if not selected:
+            logger.warning("No quotable events found (hourly=%d, daily=%d, weekly=%d)",
+                           len(hourly_events), len(daily_events), len(weekly_events))
+            return
+
+        # Set ATM tracker from the highest-priority (first) strike near 50c
+        for m, tier in selected:
+            if m.get("_is_atm"):
+                self.atm_ticker = m.get("ticker", "")
+                self.current_atm_strike = m["_strike"]
+                break
+
+        # Build new strikes dict
+        new_strikes = {}
+        for m, tier in selected:
+            ticker = m.get("ticker", "")
+            strike = m["_strike"]
+            if ticker in self.strikes:
+                st = self.strikes[ticker]
+                st.event_tier = tier
+                new_strikes[ticker] = st
+            else:
+                new_strikes[ticker] = StrikeState(
+                    ticker=ticker, strike=strike, event_tier=tier)
+
+        # Handle strikes not in new selection.
+        self._handle_removed_strikes(new_strikes)
+
+        old_tickers = set(self.strikes.keys())
+        new_tickers = set(new_strikes.keys())
+        if new_tickers != old_tickers:
+            added = new_tickers - old_tickers
+            removed = old_tickers - new_tickers
+            if added:
+                logger.info("Added strikes: %s", added)
+            if removed:
+                logger.info("Removed strikes: %s", removed)
+
+        self.strikes = new_strikes
+
+    def _pick_atm_from_events(self, events_dict, prefer="shortest"):
+        """Pick ATM + neighbors from a set of events.
+
+        prefer="shortest": pick event with smallest TTL (hourly preference)
+        prefer="midpoint": pick event with TTL closest to midpoint of its tier
+        Returns list of market dicts with _strike and _is_atm set.
+        """
+        if not events_dict:
+            return []
+
+        # Pick the best event
+        if prefer == "shortest":
+            best_event = min(events_dict.keys(),
+                             key=lambda e: events_dict[e][0]["_ttl"])
+        else:
+            # midpoint of daily range
+            mid_ttl = (mc.MM_HOURLY_MAX_TTL + mc.MM_DAILY_MAX_TTL) / 2
+            best_event = min(events_dict.keys(),
+                             key=lambda e: abs(events_dict[e][0]["_ttl"] - mid_ttl))
+
+        candidates = events_dict[best_event]
+
+        # Parse strikes and sort
         for m in candidates:
-            # Strike is typically in the ticker or subtitle
-            strike_val = self._parse_strike(m)
-            m["_strike"] = strike_val
-
+            m["_strike"] = self._parse_strike(m)
         candidates = [m for m in candidates if m["_strike"] is not None]
         candidates.sort(key=lambda m: m["_strike"])
 
         if not candidates:
-            logger.warning("Could not parse strikes for %s", best_event)
-            return
+            return []
 
-        # Find ATM: probe middle strikes, pick yes_ask nearest 50c
+        # Find ATM: probe middle strikes, pick yes_bid nearest 50c
         mid_idx = len(candidates) // 2
         start = max(0, mid_idx - 5)
         end = min(len(candidates), mid_idx + 5)
@@ -477,7 +789,6 @@ class MarketMaker:
                 book = get_orderbook(ticker, depth=1)
                 yes_levels = book.get("yes", [])
                 if yes_levels:
-                    # Best yes bid = highest price in the yes buy book
                     best_yb = max(l[0] for l in yes_levels if isinstance(l, list))
                 else:
                     best_yb = 50
@@ -491,47 +802,59 @@ class MarketMaker:
         if best_atm is None:
             best_atm = candidates[len(candidates) // 2]
 
-        # Track ATM for vol sampling and strike % move detection
-        self.atm_ticker = best_atm.get("ticker", "")
-        self.current_atm_strike = best_atm["_strike"]
-
+        best_atm["_is_atm"] = True
         atm_idx = candidates.index(best_atm)
 
         # Select ATM + 1 above + 1 below
-        selected = []
+        result = []
         if atm_idx > 0:
-            selected.append(candidates[atm_idx - 1])
-        selected.append(best_atm)
+            result.append(candidates[atm_idx - 1])
+        result.append(best_atm)
         if atm_idx < len(candidates) - 1:
-            selected.append(candidates[atm_idx + 1])
+            result.append(candidates[atm_idx + 1])
 
-        # Build new strikes dict, keeping existing state if ticker matches
-        new_strikes = {}
-        for m in selected:
-            ticker = m.get("ticker", "")
-            strike = m["_strike"]
-            if ticker in self.strikes:
-                new_strikes[ticker] = self.strikes[ticker]
-            else:
-                new_strikes[ticker] = StrikeState(ticker=ticker, strike=strike)
+        ttl = candidates[0]["_ttl"]
+        tier = candidates[0]["_tier"]
+        logger.info("Selected %d %s strikes from %s (TTL=%.0fm, ATM=%.0f)",
+                     len(result), tier, best_event, ttl / 60,
+                     best_atm["_strike"])
 
-        # Keep old strikes that have inventory (don't abandon positions)
+        return result
+
+    def _handle_removed_strikes(self, new_strikes):
+        """Handle strikes being removed from the active set.
+
+        - exit_only with inventory: keep stable
+        - exit_only with zero inventory: drop
+        - newly removed: final fill check, mark exit_only if has inventory
+        - weekly with inventory: mark exit_only (never open new on weekly)
+        """
         for ticker, st in self.strikes.items():
-            if ticker not in new_strikes and st.inventory != 0:
+            if ticker in new_strikes:
+                st.exit_only = False
+                continue
+
+            if st.exit_only and st.inventory != 0:
                 new_strikes[ticker] = st
-                logger.info("Keeping %s (inv=%d) despite ATM shift", ticker, st.inventory)
+                continue
 
-        old_tickers = set(self.strikes.keys())
-        new_tickers = set(new_strikes.keys())
-        if new_tickers != old_tickers:
-            added = new_tickers - old_tickers
-            removed = old_tickers - new_tickers
-            if added:
-                logger.info("Added strikes: %s", added)
-            if removed:
-                logger.info("Removed strikes: %s", removed)
+            if st.exit_only and st.inventory == 0:
+                logger.info("Exit-only strike %s inventory cleared — removing", ticker)
+                self._cancel_if_active(st, "bid")
+                self._cancel_if_active(st, "ask")
+                continue
 
-        self.strikes = new_strikes
+            # Newly removed strike — do final fill check before dropping
+            self._check_fills(st)
+            self._cancel_if_active(st, "bid")
+            self._cancel_if_active(st, "ask")
+            logger.info("Final fill check for removed strike %s: inv=%d rpnl=%.0fc",
+                        ticker, st.inventory, st.realized_pnl)
+
+            if st.inventory != 0:
+                st.exit_only = True
+                new_strikes[ticker] = st
+                logger.info("Keeping %s as exit_only (inv=%d)", ticker, st.inventory)
 
     def _parse_strike(self, market):
         """Extract numeric strike from market data."""
@@ -570,7 +893,17 @@ class MarketMaker:
         # 3. Compute quotes
         bid_target, ask_target = self._compute_quotes(st, book)
 
-        # 4. Manage orders (pass book for spread-crossing checks)
+        # 4. If we have inventory but compute_quotes returned None (empty book
+        #    or narrow spread), compute an exit-only price for the reducing side.
+        if st.inventory != 0 and bid_target is None and ask_target is None:
+            exit_price = self._compute_exit_price(st, book)
+            if exit_price is not None:
+                if st.inventory > 0:
+                    ask_target = exit_price  # need to sell yes (buy no)
+                else:
+                    bid_target = exit_price  # need to buy yes
+
+        # 5. Manage orders (pass book for spread-crossing checks)
         self._manage_orders(st, bid_target, ask_target, book)
 
     def _compute_quotes(self, st: StrikeState, book: dict):
@@ -595,11 +928,14 @@ class MarketMaker:
         derived_yes_ask = 100 - best_no_bid
         native_spread = derived_yes_ask - best_yes_bid
 
-        if native_spread < mc.MM_MIN_BOOK_SPREAD:
-            return None, None
-
         # Mid from best yes bid and derived yes ask
         mid = (best_yes_bid + derived_yes_ask) / 2
+
+        # Always save last_mid for exit pricing fallback
+        st.last_mid = mid
+
+        if native_spread < mc.MM_MIN_BOOK_SPREAD:
+            return None, None
 
         # Inventory skew: push mid away from inventory
         adjusted_mid = mid - (st.inventory * 1)
@@ -618,6 +954,51 @@ class MarketMaker:
             return None, None
 
         return target_bid, target_ask
+
+    def _compute_exit_price(self, st: StrikeState, book: dict):
+        """Compute a price for the inventory-reducing side only.
+
+        Used when _compute_quotes returns None (empty book or narrow spread)
+        but we need to exit a position. Uses whatever book data is available,
+        falling back to last_mid.
+        """
+        yes_levels = book.get("yes", [])
+        no_levels = book.get("no", [])
+        best_yes_bid = self._best_bid(yes_levels)
+        best_no_bid = self._best_bid(no_levels)
+
+        # Try to get a mid from whatever is available
+        mid = None
+        if best_yes_bid is not None and best_no_bid is not None:
+            mid = (best_yes_bid + (100 - best_no_bid)) / 2
+        elif best_yes_bid is not None:
+            mid = best_yes_bid + self.current_half_spread
+        elif best_no_bid is not None:
+            mid = (100 - best_no_bid) - self.current_half_spread
+
+        # Fall back to last known mid
+        if mid is None:
+            mid = st.last_mid if st.last_mid > 0 else 50
+
+        half = self.current_half_spread
+
+        if st.inventory > 0:
+            # Need to sell yes = post ask. Use mid + half_spread.
+            price = int(mid + half)
+            price = max(2, min(99, price))
+            # Don't cross: if there's a yes bid, ask must be above it
+            if best_yes_bid is not None:
+                price = max(price, best_yes_bid + 1)
+            return price
+        else:
+            # Need to buy yes = post bid. Use mid - half_spread.
+            price = int(mid - half)
+            price = max(1, min(98, price))
+            # Don't cross: if there's a derived ask, bid must be below it
+            if best_no_bid is not None:
+                derived_ask = 100 - best_no_bid
+                price = min(price, derived_ask - 1)
+            return price
 
     def _best_bid(self, levels):
         """Extract highest bid price from orderbook levels [[price, qty], ...]."""
@@ -755,7 +1136,11 @@ class MarketMaker:
             st.ask_last_remaining = 0
 
     def _cancel_if_active(self, st: StrikeState, side: str, now: float = 0.0):
-        """Cancel an existing order if it's active."""
+        """Cancel an existing order if it's active.
+
+        When cancel fails, checks if the order was filled and records fills
+        to prevent untracked positions (the root cause of stranded inventory).
+        """
         order_id = st.bid_order_id if side == "bid" else st.ask_order_id
         placed_at = st.bid_placed_at if side == "bid" else st.ask_placed_at
 
@@ -775,13 +1160,22 @@ class MarketMaker:
         if now > 0 and placed_at > 0:
             self.queue_times.append(now - placed_at)
 
+        # Check for fills BEFORE cancelling — catch any fills since last check
+        self._check_order_fill(st, side)
+
         try:
             cancel_order(order_id)
             mm_logger.log_quote(st.ticker, side,
                                 st.bid_price if side == "bid" else st.ask_price,
                                 mc.MM_QUOTE_SIZE, "cancel")
         except Exception:
-            logger.debug("Cancel failed for %s (may already be filled/cancelled)", order_id)
+            # Cancel failed — order may have been filled between our check and cancel.
+            # Do one more fill check to catch any last-moment fills.
+            logger.debug("Cancel failed for %s — checking if filled", order_id)
+            try:
+                self._check_order_fill(st, side)
+            except Exception:
+                logger.debug("Post-cancel fill check also failed for %s", order_id)
 
         if side == "bid":
             st.bid_order_id = ""
