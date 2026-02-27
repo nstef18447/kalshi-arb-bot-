@@ -5,8 +5,14 @@ import os
 MM_SERIES = os.getenv("MM_SERIES", "KXBTCD")
 MM_SERIES_LIST = [s.strip() for s in os.getenv("MM_SERIES_LIST", MM_SERIES).split(",")]
 MM_POLL_OVERRIDES = {"KXBTCD": 5, "KXBTC15M": 1}  # seconds between poll cycles per series
+MM_QUOTE_SIZE_OVERRIDES: dict[str, int] = {}       # per-series quote size (parsed below)
 MM_HALF_SPREAD = int(os.getenv("MM_HALF_SPREAD", "5"))
 MM_QUOTE_SIZE = int(os.getenv("MM_QUOTE_SIZE", "5"))
+# Per-series quote size: MM_QUOTE_SIZE_KXBTC15M=5, etc.
+for _s in MM_SERIES_LIST:
+    _env_val = os.getenv(f"MM_QUOTE_SIZE_{_s}")
+    if _env_val is not None:
+        MM_QUOTE_SIZE_OVERRIDES[_s] = int(_env_val)
 MM_MAX_INVENTORY = int(os.getenv("MM_MAX_INVENTORY", "5"))
 MM_MAX_LOSS = int(os.getenv("MM_MAX_LOSS", "2500"))          # cents ($25)
 MM_STRIKES = os.getenv("MM_STRIKES", "auto").lower()

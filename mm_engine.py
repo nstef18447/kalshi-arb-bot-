@@ -70,6 +70,7 @@ class MarketMaker:
         self.contract_type = config.SERIES.get(self.series, {}).get("contract_type", "above_below")
         self.poll_interval = mc.MM_POLL_OVERRIDES.get(series, mc.MM_REQUOTE_INTERVAL)
         self._halt_event = halt_event or threading.Event()
+        self.quote_size = self.quote_size_OVERRIDES.get(series, self.quote_size)
 
         self.running = False
         self._stopped = False
@@ -1096,16 +1097,16 @@ class MarketMaker:
     def _place_bid(self, st: StrikeState, price: int):
         """Place bid = buy yes at price."""
         st.bid_price = price
-        st.bid_last_remaining = mc.MM_QUOTE_SIZE
+        st.bid_last_remaining = self.quote_size
         st.bid_placed_at = time.time()
-        mm_logger.log_quote(st.ticker, "bid", price, mc.MM_QUOTE_SIZE, "place")
+        mm_logger.log_quote(st.ticker, "bid", price, self.quote_size, "place")
 
         if not mc.MM_CONFIRM:
             st.bid_order_id = f"DRY-BID-{uuid.uuid4().hex[:8]}"
             return
 
         try:
-            order = create_order(st.ticker, "yes", price, mc.MM_QUOTE_SIZE,
+            order = create_order(st.ticker, "yes", price, self.quote_size,
                                  post_only=True)
             st.bid_order_id = order.get("order_id", "")
         except Exception:
@@ -1116,17 +1117,17 @@ class MarketMaker:
     def _place_ask(self, st: StrikeState, price: int):
         """Place ask = buy no at (100 - price) to sell yes at price."""
         st.ask_price = price
-        st.ask_last_remaining = mc.MM_QUOTE_SIZE
+        st.ask_last_remaining = self.quote_size
         st.ask_placed_at = time.time()
         no_price = 100 - price
-        mm_logger.log_quote(st.ticker, "ask", price, mc.MM_QUOTE_SIZE, "place")
+        mm_logger.log_quote(st.ticker, "ask", price, self.quote_size, "place")
 
         if not mc.MM_CONFIRM:
             st.ask_order_id = f"DRY-ASK-{uuid.uuid4().hex[:8]}"
             return
 
         try:
-            order = create_order(st.ticker, "no", no_price, mc.MM_QUOTE_SIZE,
+            order = create_order(st.ticker, "no", no_price, self.quote_size,
                                  post_only=True)
             st.ask_order_id = order.get("order_id", "")
         except Exception:
@@ -1167,7 +1168,7 @@ class MarketMaker:
             cancel_order(order_id)
             mm_logger.log_quote(st.ticker, side,
                                 st.bid_price if side == "bid" else st.ask_price,
-                                mc.MM_QUOTE_SIZE, "cancel")
+                                self.quote_size, "cancel")
         except Exception:
             # Cancel failed — order may have been filled between our check and cancel.
             # Do one more fill check to catch any last-moment fills.
