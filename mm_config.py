@@ -44,7 +44,7 @@ MM_BTC_SPOT_LOOKBACK = int(os.getenv("MM_BTC_SPOT_LOOKBACK", "10"))  # seconds l
 MM_BTC_SPOT_PAUSE = int(os.getenv("MM_BTC_SPOT_PAUSE", "15"))  # seconds to pause after trigger
 
 # --- One-sided fill detector ---
-MM_ONESIDED_FILL_LIMIT = int(os.getenv("MM_ONESIDED_FILL_LIMIT", "2"))  # consecutive same-side fills before pause
+MM_ONESIDED_FILL_LIMIT = int(os.getenv("MM_ONESIDED_FILL_LIMIT", "4"))  # consecutive same-side fills before pause
 MM_ONESIDED_PAUSE = int(os.getenv("MM_ONESIDED_PAUSE", "30"))  # seconds to pause after trigger
 
 # --- Volatility-adaptive spread ---

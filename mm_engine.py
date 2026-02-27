@@ -1308,7 +1308,9 @@ class MarketMaker:
             order = create_order(st.ticker, "yes", price, self.quote_size,
                                  post_only=True)
             st.bid_order_id = order.get("order_id", "")
-        except Exception:
+        except Exception as e:
+            if self._is_market_gone(e, st):
+                return
             logger.exception("Failed to place bid on %s at %d", st.ticker, price)
             st.bid_order_id = ""
             st.bid_last_remaining = 0
@@ -1329,11 +1331,29 @@ class MarketMaker:
             order = create_order(st.ticker, "no", no_price, self.quote_size,
                                  post_only=True)
             st.ask_order_id = order.get("order_id", "")
-        except Exception:
+        except Exception as e:
+            if self._is_market_gone(e, st):
+                return
             logger.exception("Failed to place ask on %s at %d (no@%d)",
                              st.ticker, price, no_price)
             st.ask_order_id = ""
             st.ask_last_remaining = 0
+
+    def _is_market_gone(self, exc: Exception, st: StrikeState) -> bool:
+        """Check if a 404 error means the market has settled/expired.
+
+        If so, remove the strike immediately to stop spamming 404s every cycle.
+        Returns True if the error was handled (caller should return early).
+        """
+        exc_str = str(exc)
+        if "404" not in exc_str:
+            return False
+        logger.warning("[%s] Market %s returned 404 — settled/expired, "
+                       "removing (inv=%d, rpnl=%.0fc)",
+                       self.series, st.ticker, st.inventory, st.realized_pnl)
+        # Remove from strikes dict entirely — market is gone
+        self.strikes.pop(st.ticker, None)
+        return True
 
     def _cancel_if_active(self, st: StrikeState, side: str, now: float = 0.0):
         """Cancel an existing order if it's active.
