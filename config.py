@@ -2,7 +2,7 @@ import os
 
 # --- Mode ---
 MODE = os.getenv("MODE", "read_only").lower()
-READ_ONLY = MODE not in ("arb", "market_maker")
+READ_ONLY = MODE not in ("arb", "market_maker", "binary_arb") or os.getenv("READ_ONLY", "").lower() in ("true", "1")
 
 ARB_THRESHOLD = 95          # Max combined price in cents to trigger arb
 MAX_CONTRACTS = 25          # Contracts per leg
@@ -24,6 +24,8 @@ SERIES = {
     "KXBTC":        {"taker_fee": 0.07,  "maker_mult": 0.0175, "poll_every": 6, "contract_type": "range"},
     "KXETH":        {"taker_fee": 0.07,  "maker_mult": 0.0175, "poll_every": 6, "contract_type": "range"},
     "KXSOLE":       {"taker_fee": 0.07,  "maker_mult": 0.0175, "poll_every": 6, "contract_type": "range"},
+    # Binary contracts — same-market yes+no arb
+    "KXBTC15M":     {"taker_fee": 0.07,  "maker_mult": 0.0175, "poll_every": 1, "contract_type": "binary"},
 }
 
 # --- Execution tuning ---
@@ -39,3 +41,9 @@ COOLDOWN_MINUTES = 10       # Minutes to pause when circuit breaker trips
 # --- Ladder scanner ---
 SNAPSHOT_CACHE_SIZE = 12        # Last N snapshots per window (12 × 5s = 60s)
 SOFT_ARB_PROB_THRESHOLD = 0.60  # Min range probability for soft arb flag
+
+# --- Binary arb (KXBTC15M) ---
+BINARY_ARB_THRESHOLD = int(os.getenv("BINARY_ARB_THRESHOLD", "96"))
+BINARY_ARB_SIZE = int(os.getenv("BINARY_ARB_SIZE", "10"))
+BINARY_ARB_COOLDOWN = int(os.getenv("BINARY_ARB_COOLDOWN", "30"))
+BINARY_ARB_HEDGE_DELAY = int(os.getenv("BINARY_ARB_HEDGE_DELAY", "8"))

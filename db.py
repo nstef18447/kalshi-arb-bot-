@@ -83,6 +83,23 @@ CREATE TABLE IF NOT EXISTS trades (
     fees REAL
 );
 
+CREATE TABLE IF NOT EXISTS binary_arb_trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp REAL NOT NULL,
+    ticker TEXT NOT NULL,
+    yes_price INTEGER NOT NULL,
+    no_price INTEGER NOT NULL,
+    combined_cost INTEGER NOT NULL,
+    size INTEGER NOT NULL,
+    yes_order_id TEXT,
+    no_order_id TEXT,
+    yes_filled INTEGER NOT NULL DEFAULT 0,
+    no_filled INTEGER NOT NULL DEFAULT 0,
+    hedge_action TEXT,
+    realized_pnl REAL,
+    fees REAL
+);
+
 CREATE TABLE IF NOT EXISTS mm_quotes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp REAL NOT NULL,
@@ -135,6 +152,8 @@ CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(timestamp);
 CREATE INDEX IF NOT EXISTS idx_stability_ts ON arb_stability(timestamp);
 CREATE INDEX IF NOT EXISTS idx_stability_status ON arb_stability(status);
 CREATE INDEX IF NOT EXISTS idx_stability_pair ON arb_stability(expiry_window, strike_low, strike_high);
+CREATE INDEX IF NOT EXISTS idx_bat_ts ON binary_arb_trades(timestamp);
+CREATE INDEX IF NOT EXISTS idx_bat_ticker ON binary_arb_trades(ticker);
 CREATE INDEX IF NOT EXISTS idx_mm_quotes_ts ON mm_quotes(timestamp);
 CREATE INDEX IF NOT EXISTS idx_mm_quotes_ticker ON mm_quotes(ticker);
 CREATE INDEX IF NOT EXISTS idx_mm_fills_ts ON mm_fills(timestamp);

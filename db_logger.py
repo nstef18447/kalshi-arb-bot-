@@ -244,6 +244,41 @@ def get_stability_summary(window_seconds=1800):
         conn.close()
 
 
+def log_binary_arb_trade(ticker, yes_price, no_price, combined_cost, size,
+                         yes_order_id=None, no_order_id=None):
+    """Log a binary arb trade attempt. Returns the row id for later updates."""
+    conn = db.get_connection()
+    try:
+        cursor = conn.execute(
+            "INSERT INTO binary_arb_trades "
+            "(timestamp, ticker, yes_price, no_price, combined_cost, size, "
+            "yes_order_id, no_order_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (time.time(), ticker, yes_price, no_price, combined_cost, size,
+             yes_order_id, no_order_id),
+        )
+        conn.commit()
+        return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def update_binary_arb_trade(row_id, yes_filled=0, no_filled=0,
+                            hedge_action=None, realized_pnl=None, fees=None):
+    """Update a binary arb trade with fill/hedge results."""
+    conn = db.get_connection()
+    try:
+        conn.execute(
+            "UPDATE binary_arb_trades SET "
+            "yes_filled = ?, no_filled = ?, hedge_action = ?, "
+            "realized_pnl = ?, fees = ? WHERE id = ?",
+            (yes_filled, no_filled, hedge_action, realized_pnl, fees, row_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def log_trade(expiry_window, opp_type, strike_low, strike_high,
               leg1_side, leg1_price, leg1_fill_status,
               leg2_side=None, leg2_price=None, leg2_fill_status=None,

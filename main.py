@@ -4,6 +4,9 @@ import logging
 
 from dotenv import load_dotenv
 
+# Load .env BEFORE importing config so MODE/READ_ONLY are set correctly
+load_dotenv()
+
 import config
 import db_logger
 from bot import ArbBot
@@ -52,7 +55,9 @@ def print_config():
         print(f"  Strikes:         {mc.MM_STRIKES}")
         print(f"  Requote interval:{mc.MM_REQUOTE_INTERVAL}s")
         print(f"  Stale quote:     {mc.MM_STALE_QUOTE_SECONDS}s")
-        print(f"  TTL window:      {mc.MM_MIN_EXPIRY}s — {mc.MM_MAX_EXPIRY}s")
+        print(f"  Min TTL:         {mc.MM_MIN_EXPIRY}s")
+        print(f"  Tier cutoffs:    hourly <{mc.MM_HOURLY_MAX_TTL/3600:.0f}h, daily <{mc.MM_DAILY_MAX_TTL/3600:.0f}h, weekly >={mc.MM_DAILY_MAX_TTL/3600:.0f}h")
+        print(f"  Quote weekly:    {mc.MM_QUOTE_WEEKLY}")
         print(f"  Quote tolerance: {mc.MM_QUOTE_TOLERANCE}c")
         print(f"  Min book spread: {mc.MM_MIN_BOOK_SPREAD}c")
         print(f"  Max API errors:  {mc.MM_MAX_API_ERRORS}")
@@ -60,6 +65,23 @@ def print_config():
             print(f"\n  MODE: LIVE QUOTING")
         else:
             print(f"\n  MODE: DRY RUN (no orders placed)")
+        print(f"{'='*50}\n")
+        return
+
+    if config.MODE == "binary_arb":
+        print(f"\n{'='*50}")
+        print(f"  Kalshi Binary Arb Bot — {env}")
+        print(f"{'='*50}")
+        print(f"  Series:          KXBTC15M")
+        print(f"  Threshold:       {config.BINARY_ARB_THRESHOLD} cents (yes+no combined)")
+        print(f"  Size:            {config.BINARY_ARB_SIZE} contracts")
+        print(f"  Cooldown:        {config.BINARY_ARB_COOLDOWN}s per ticker")
+        print(f"  Hedge delay:     {config.BINARY_ARB_HEDGE_DELAY}s")
+        print(f"  Poll interval:   {config.POLL_INTERVAL}s")
+        if config.READ_ONLY:
+            print(f"\n  MODE: READ-ONLY (scan only, no trading)")
+        else:
+            print(f"\n  MODE: LIVE TRADING")
         print(f"{'='*50}\n")
         return
 
@@ -87,7 +109,6 @@ def print_config():
 
 
 def main():
-    load_dotenv()
     setup_logging()
     validate_env()
     print_config()
@@ -105,8 +126,11 @@ def main():
         print(f"  Account balance: ${balance / 100:,.2f}\n")
     except Exception as e:
         print(f"  Could not fetch balance: {e}\n")
-        print("  Check your API credentials and try again.")
-        sys.exit(1)
+        if config.READ_ONLY:
+            print("  Continuing in READ_ONLY mode (balance not required).\n")
+        else:
+            print("  Check your API credentials and try again.")
+            sys.exit(1)
 
     if config.MODE == "market_maker":
         from mm_engine import MarketMaker
@@ -118,6 +142,16 @@ def main():
         finally:
             mm.stop()
             print("\nMarket maker shut down cleanly.")
+    elif config.MODE == "binary_arb":
+        from binary_arb_bot import BinaryArbBot
+        bot = BinaryArbBot()
+        try:
+            bot.start()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            bot.stop()
+            print("\nBinary arb bot shut down cleanly.")
     else:
         bot = ArbBot()
         try:
