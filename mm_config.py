@@ -5,6 +5,7 @@ import os
 MM_SERIES = os.getenv("MM_SERIES", "KXBTCD")
 MM_SERIES_LIST = [s.strip() for s in os.getenv("MM_SERIES_LIST", MM_SERIES).split(",")]
 MM_POLL_OVERRIDES = {"KXBTCD": 5, "KXBTC15M": 1}  # seconds between poll cycles per series
+MM_MIN_TTL_SECONDS = int(os.getenv("MM_MIN_TTL_SECONDS", "180"))  # stop quoting binary windows with TTL below this
 MM_QUOTE_SIZE_OVERRIDES: dict[str, int] = {}       # per-series quote size (parsed below)
 MM_HALF_SPREAD = int(os.getenv("MM_HALF_SPREAD", "5"))
 MM_QUOTE_SIZE = int(os.getenv("MM_QUOTE_SIZE", "5"))

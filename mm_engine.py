@@ -62,6 +62,7 @@ class StrikeState:
     last_mid: float = 0.0       # last known midprice for exit pricing when book is empty
     exit_only: bool = False      # True when kept solely for inventory exit (ATM moved away)
     event_tier: str = ""         # "hourly", "daily", or "weekly"
+    close_ts: float = 0.0       # expiry timestamp for TTL checks
 
 
 class MarketMaker:
@@ -340,6 +341,27 @@ class MarketMaker:
         if not self.strikes:
             logger.warning("No strikes selected — skipping cycle")
             return
+
+        # --- Binary TTL cutoff: stop quoting near expiry ---
+        if self.contract_type == "binary":
+            now_ttl = time.time()
+            active_st = self.strikes.get(self.atm_ticker)
+            if active_st and active_st.close_ts > 0 and not active_st.exit_only:
+                ttl = active_st.close_ts - now_ttl
+                if ttl < mc.MM_MIN_TTL_SECONDS:
+                    # Cancel all orders and mark exit_only until window expires
+                    self._check_fills(active_st)
+                    self._cancel_if_active(active_st, "bid")
+                    self._cancel_if_active(active_st, "ask")
+                    if active_st.inventory != 0:
+                        active_st.exit_only = True
+                        logger.info("[%s] TTL cutoff (%.0fs left) — exit_only (inv=%d)",
+                                    self.series, ttl, active_st.inventory)
+                    else:
+                        del self.strikes[self.atm_ticker]
+                        logger.info("[%s] TTL cutoff (%.0fs left) — cleared, waiting for next window",
+                                    self.series, ttl)
+                    return
 
         # --- Volatility tracking: record current midprice + ATM strike ---
         sample_mid = self._sample_midprice()
@@ -625,14 +647,30 @@ class MarketMaker:
                 else:
                     del self.strikes[old_ticker]
 
+        # Parse close_time for TTL checks
+        close_ts = 0.0
+        close_time = market.get("close_time") or market.get("expiration_time", "")
+        if close_time:
+            try:
+                from datetime import datetime, timezone
+                if isinstance(close_time, str):
+                    ct = close_time.replace("Z", "+00:00")
+                    close_ts = datetime.fromisoformat(ct).timestamp()
+                else:
+                    close_ts = float(close_time)
+            except (ValueError, TypeError):
+                pass
+
         # Create new StrikeState for the active ticker
         if ticker not in self.strikes:
-            self.strikes[ticker] = StrikeState(ticker=ticker, strike=strike)
+            self.strikes[ticker] = StrikeState(ticker=ticker, strike=strike, close_ts=close_ts)
+        elif close_ts > 0:
+            self.strikes[ticker].close_ts = close_ts
 
         self.atm_ticker = ticker
         self.current_atm_strike = strike
-        logger.info("[%s] Binary strike selected: %s (strike=%.2f)",
-                    self.series, ticker, strike)
+        logger.info("[%s] Binary strike selected: %s (strike=%.2f, TTL=%.0fs)",
+                    self.series, ticker, strike, max(0, close_ts - time.time()))
 
     def _select_strikes_ladder(self):
         markets = get_markets(self.series)
@@ -891,6 +929,15 @@ class MarketMaker:
         # 2. Check fills on existing orders
         self._check_fills(st)
 
+        # 2b. Inventory overshoot protection: if at or past max, cancel BOTH sides
+        #     immediately to prevent more fills from resting orders between cycles
+        if abs(st.inventory) >= mc.MM_MAX_INVENTORY:
+            if st.bid_order_id or st.ask_order_id:
+                logger.info("[%s] Inventory at max (%d) — cancelling both sides on %s",
+                            self.series, st.inventory, st.ticker)
+                self._cancel_if_active(st, "bid")
+                self._cancel_if_active(st, "ask")
+
         # 3. Compute quotes
         bid_target, ask_target = self._compute_quotes(st, book)
 
@@ -1025,8 +1072,13 @@ class MarketMaker:
         best_no_bid = self._best_bid(no_levels)
         derived_yes_ask = (100 - best_no_bid) if best_no_bid is not None else None
 
+        # Inventory limits: only allow reducing side when at/past max
+        inv = st.inventory
+        allow_bid = inv < mc.MM_MAX_INVENTORY    # bid = buy yes = increases inv
+        allow_ask = inv > -mc.MM_MAX_INVENTORY   # ask = buy no = decreases inv
+
         # Handle bid side
-        if bid_target is not None and st.inventory < mc.MM_MAX_INVENTORY:
+        if bid_target is not None and allow_bid:
             if st.bid_order_id and self._should_keep_order(
                 st, "bid", bid_target, derived_yes_ask, best_yes_bid, now
             ):
@@ -1040,7 +1092,7 @@ class MarketMaker:
             st.bid_price = 0
 
         # Handle ask side
-        if ask_target is not None and st.inventory > -mc.MM_MAX_INVENTORY:
+        if ask_target is not None and allow_ask:
             if st.ask_order_id and self._should_keep_order(
                 st, "ask", ask_target, derived_yes_ask, best_yes_bid, now
             ):
