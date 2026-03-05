@@ -279,6 +279,201 @@ def update_binary_arb_trade(row_id, yes_filled=0, no_filled=0,
         conn.close()
 
 
+def log_paper_trade(event_ticker, series_ticker, event_title,
+                    bucket_ticker, bucket_label, category, signal_type,
+                    entry_price, fair_value_est, overpricing_gap,
+                    total_event_excess, yes_depth=0,
+                    yes_bid=None, yes_ask=None, spread=None, bid_depth=None):
+    """Log a hypothetical SELL YES paper trade."""
+    conn = db.get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO paper_trades "
+            "(timestamp, event_ticker, series_ticker, event_title, "
+            "bucket_ticker, bucket_label, category, signal_type, "
+            "entry_price, fair_value_est, overpricing_gap, "
+            "total_event_excess, yes_depth, "
+            "yes_bid, yes_ask, spread, bid_depth) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (time.time(), event_ticker, series_ticker, event_title,
+             bucket_ticker, bucket_label, category, signal_type,
+             entry_price, fair_value_est, overpricing_gap,
+             total_event_excess, yes_depth,
+             yes_bid, yes_ask, spread, bid_depth),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def log_paper_near_miss(event_ticker, series_ticker, bucket_ticker,
+                        bucket_label, category, signal_type,
+                        yes_price, fair_value_est, gap, threshold_used):
+    """Log a bucket that was close to the signal threshold but didn't fire."""
+    conn = db.get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO paper_near_misses "
+            "(timestamp, event_ticker, series_ticker, bucket_ticker, "
+            "bucket_label, category, signal_type, "
+            "yes_price, fair_value_est, gap, threshold_used) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (time.time(), event_ticker, series_ticker, bucket_ticker,
+             bucket_label, category, signal_type,
+             yes_price, fair_value_est, gap, threshold_used),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def resolve_paper_trade(trade_id, resolved_price, pnl_cents, adjusted_pnl_cents=None):
+    """Mark a paper trade as resolved with outcome and P&L."""
+    conn = db.get_connection()
+    try:
+        conn.execute(
+            "UPDATE paper_trades SET status = 'resolved', "
+            "resolved_price = ?, pnl_cents = ?, adjusted_pnl_cents = ?, resolved_at = ? "
+            "WHERE id = ?",
+            (resolved_price, pnl_cents, adjusted_pnl_cents, time.time(), trade_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_open_paper_trades():
+    """Return all open (unresolved) paper trades."""
+    conn = db.get_connection(readonly=True)
+    try:
+        rows = conn.execute(
+            "SELECT id, event_ticker, series_ticker, bucket_ticker, "
+            "entry_price, category, signal_type, yes_bid "
+            "FROM paper_trades WHERE status = 'open'"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def has_open_or_recent_paper_trade(bucket_ticker, cooldown_seconds=86400):
+    """Check if a bucket already has an open trade OR was traded within cooldown.
+
+    Returns True if we should SKIP logging a new paper trade for this ticker.
+    Dedup rules:
+    1. If there's an open (unresolved) trade for this ticker → skip
+    2. If the most recent trade (open or resolved) was within cooldown_seconds → skip
+    """
+    conn = db.get_connection(readonly=True)
+    try:
+        # Check for any open trade on this ticker
+        open_row = conn.execute(
+            "SELECT 1 FROM paper_trades WHERE bucket_ticker = ? AND status = 'open' LIMIT 1",
+            (bucket_ticker,),
+        ).fetchone()
+        if open_row:
+            return True
+
+        # Check cooldown: most recent trade (any status) within window
+        cutoff = time.time() - cooldown_seconds
+        recent_row = conn.execute(
+            "SELECT 1 FROM paper_trades WHERE bucket_ticker = ? AND timestamp >= ? LIMIT 1",
+            (bucket_ticker, cutoff),
+        ).fetchone()
+        return recent_row is not None
+    finally:
+        conn.close()
+
+
+def log_mispricing_signal(event_ticker, series_ticker, event_title,
+                          bucket_ticker, bucket_label, category,
+                          current_price, fair_value_est, overpricing_gap,
+                          total_event_excess, yes_depth=0,
+                          yes_bid=None, yes_ask=None, spread=None, bid_depth=None):
+    """Log a detected mispricing signal (overpriced YES bucket)."""
+    conn = db.get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO mispricing_signals "
+            "(timestamp, event_ticker, series_ticker, event_title, "
+            "bucket_ticker, bucket_label, category, "
+            "current_price, fair_value_est, overpricing_gap, "
+            "total_event_excess, yes_depth, "
+            "yes_bid, yes_ask, spread, bid_depth) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (time.time(), event_ticker, series_ticker, event_title,
+             bucket_ticker, bucket_label, category,
+             current_price, fair_value_est, overpricing_gap,
+             total_event_excess, yes_depth,
+             yes_bid, yes_ask, spread, bid_depth),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def log_live_order(paper_trade_id, order_id, bucket_ticker, price_cents, count, expires_at,
+                   side="yes", action="sell"):
+    """Log a live order placed on Kalshi."""
+    conn = db.get_connection()
+    try:
+        cursor = conn.execute(
+            "INSERT INTO live_orders "
+            "(timestamp, paper_trade_id, order_id, bucket_ticker, side, action, "
+            "price_cents, count, status, expires_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)",
+            (time.time(), paper_trade_id, order_id, bucket_ticker, side, action,
+             price_cents, count, expires_at),
+        )
+        conn.commit()
+        return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def update_live_order(order_db_id, status=None, filled_count=None, filled_price=None, cancelled_at=None):
+    """Update a live order's status/fill info."""
+    conn = db.get_connection()
+    try:
+        updates = []
+        params = []
+        if status is not None:
+            updates.append("status = ?")
+            params.append(status)
+        if filled_count is not None:
+            updates.append("filled_count = ?")
+            params.append(filled_count)
+        if filled_price is not None:
+            updates.append("filled_price = ?")
+            params.append(filled_price)
+        if cancelled_at is not None:
+            updates.append("cancelled_at = ?")
+            params.append(cancelled_at)
+        if not updates:
+            return
+        params.append(order_db_id)
+        conn.execute(
+            f"UPDATE live_orders SET {', '.join(updates)} WHERE id = ?",
+            params,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_open_live_orders():
+    """Return all open live orders."""
+    conn = db.get_connection(readonly=True)
+    try:
+        rows = conn.execute(
+            "SELECT id, order_id, bucket_ticker, price_cents, count, expires_at "
+            "FROM live_orders WHERE status = 'open'"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
 def log_trade(expiry_window, opp_type, strike_low, strike_high,
               leg1_side, leg1_price, leg1_fill_status,
               leg2_side=None, leg2_price=None, leg2_fill_status=None,

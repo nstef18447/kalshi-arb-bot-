@@ -342,3 +342,122 @@ def get_db_info():
         return info
     finally:
         conn.close()
+
+
+# ── Paper Trades page ──────────────────────────────────────────────
+
+
+def get_paper_trade_summary():
+    """Aggregate paper trade stats."""
+    return _read_sql("""
+        SELECT
+            COUNT(*) AS total_trades,
+            SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS open_trades,
+            SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END) AS resolved_trades,
+            SUM(CASE WHEN status = 'resolved' AND pnl_cents > 0 THEN 1 ELSE 0 END) AS wins,
+            SUM(CASE WHEN status = 'resolved' AND pnl_cents <= 0 THEN 1 ELSE 0 END) AS losses,
+            COALESCE(SUM(CASE WHEN status = 'resolved' THEN pnl_cents END), 0) AS total_pnl,
+            COALESCE(AVG(CASE WHEN status = 'resolved' THEN pnl_cents END), 0) AS avg_pnl,
+            COALESCE(AVG(CASE WHEN status = 'resolved' AND pnl_cents > 0 THEN pnl_cents END), 0) AS avg_win,
+            COALESCE(AVG(CASE WHEN status = 'resolved' AND pnl_cents <= 0 THEN pnl_cents END), 0) AS avg_loss,
+            COALESCE(AVG(overpricing_gap), 0) AS avg_edge_at_entry,
+            MIN(timestamp) AS first_trade_ts,
+            MAX(timestamp) AS last_trade_ts
+        FROM paper_trades
+    """)
+
+
+def get_paper_trades_by_signal_type():
+    """Paper trade stats broken down by signal_type."""
+    return _read_sql("""
+        SELECT
+            signal_type,
+            COUNT(*) AS total,
+            SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS open_count,
+            SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END) AS resolved,
+            SUM(CASE WHEN status = 'resolved' AND pnl_cents > 0 THEN 1 ELSE 0 END) AS wins,
+            SUM(CASE WHEN status = 'resolved' AND pnl_cents <= 0 THEN 1 ELSE 0 END) AS losses,
+            COALESCE(SUM(CASE WHEN status = 'resolved' THEN pnl_cents END), 0) AS pnl,
+            COALESCE(AVG(CASE WHEN status = 'resolved' THEN pnl_cents END), 0) AS avg_pnl,
+            COALESCE(AVG(overpricing_gap), 0) AS avg_edge
+        FROM paper_trades
+        GROUP BY signal_type
+        ORDER BY pnl DESC
+    """)
+
+
+def get_paper_trades_by_category():
+    """Paper trade stats broken down by market category."""
+    return _read_sql("""
+        SELECT
+            category,
+            COUNT(*) AS total,
+            SUM(CASE WHEN status = 'resolved' AND pnl_cents > 0 THEN 1 ELSE 0 END) AS wins,
+            SUM(CASE WHEN status = 'resolved' AND pnl_cents <= 0 THEN 1 ELSE 0 END) AS losses,
+            COALESCE(SUM(CASE WHEN status = 'resolved' THEN pnl_cents END), 0) AS pnl,
+            COALESCE(AVG(overpricing_gap), 0) AS avg_edge
+        FROM paper_trades
+        GROUP BY category
+        ORDER BY pnl DESC
+    """)
+
+
+def get_paper_cumulative_pnl():
+    """Cumulative P&L over time for resolved paper trades."""
+    return _read_sql("""
+        SELECT resolved_at AS timestamp, pnl_cents,
+               SUM(pnl_cents) OVER (ORDER BY resolved_at) AS cumulative_pnl
+        FROM paper_trades
+        WHERE status = 'resolved'
+        ORDER BY resolved_at
+    """)
+
+
+def get_paper_trades_all():
+    """All paper trades, newest first."""
+    return _read_sql("""
+        SELECT id, timestamp, event_ticker, series_ticker, event_title,
+               bucket_ticker, bucket_label, category, signal_type,
+               entry_price, fair_value_est, overpricing_gap,
+               total_event_excess, yes_depth,
+               status, resolved_price, pnl_cents, resolved_at
+        FROM paper_trades
+        ORDER BY timestamp DESC
+    """)
+
+
+def get_near_miss_summary():
+    """Near-miss stats — threshold sensitivity analysis."""
+    return _read_sql("""
+        SELECT
+            signal_type,
+            threshold_used,
+            COUNT(*) AS near_miss_count,
+            AVG(gap) AS avg_gap,
+            MIN(gap) AS min_gap,
+            MAX(gap) AS max_gap,
+            AVG(yes_price) AS avg_price
+        FROM paper_near_misses
+        GROUP BY signal_type, threshold_used
+        ORDER BY signal_type
+    """)
+
+
+def get_near_miss_gap_distribution():
+    """Gap distribution for near-misses — for threshold tuning histogram."""
+    return _read_sql("""
+        SELECT gap, signal_type, threshold_used
+        FROM paper_near_misses
+    """)
+
+
+def get_near_misses_recent(limit=50):
+    """Recent near-misses for inspection."""
+    return _read_sql("""
+        SELECT timestamp, series_ticker, bucket_ticker, bucket_label,
+               category, signal_type, yes_price, fair_value_est,
+               gap, threshold_used
+        FROM paper_near_misses
+        ORDER BY timestamp DESC
+        LIMIT ?
+    """, [limit])

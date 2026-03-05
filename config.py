@@ -2,7 +2,9 @@ import os
 
 # --- Mode ---
 MODE = os.getenv("MODE", "read_only").lower()
-READ_ONLY = MODE not in ("arb", "market_maker", "binary_arb") or os.getenv("READ_ONLY", "").lower() in ("true", "1")
+LIVE_EXECUTION = os.getenv("LIVE_EXECUTION", "").lower() in ("true", "1")
+READ_ONLY = (MODE not in ("arb", "market_maker", "binary_arb") and not LIVE_EXECUTION) or os.getenv("READ_ONLY", "").lower() in ("true", "1")
+# mispricing_scanner trades when LIVE_EXECUTION=true and READ_ONLY is not forced
 
 ARB_THRESHOLD = 95          # Max combined price in cents to trigger arb
 MAX_CONTRACTS = 25          # Contracts per leg
@@ -47,3 +49,11 @@ BINARY_ARB_THRESHOLD = int(os.getenv("BINARY_ARB_THRESHOLD", "96"))
 BINARY_ARB_SIZE = int(os.getenv("BINARY_ARB_SIZE", "10"))
 BINARY_ARB_COOLDOWN = int(os.getenv("BINARY_ARB_COOLDOWN", "30"))
 BINARY_ARB_HEDGE_DELAY = int(os.getenv("BINARY_ARB_HEDGE_DELAY", "8"))
+
+# --- Mispricing scanner ---
+MISPRICING_THRESHOLD = int(os.getenv("MISPRICING_THRESHOLD", "15"))  # cents above fair value
+MISPRICING_MIN_EXCESS = int(os.getenv("MISPRICING_MIN_EXCESS", "5"))  # min total event overpricing
+
+# --- Live execution (mispricing scanner) ---
+ORDER_SIZE = int(os.getenv("ORDER_SIZE", "10"))                # contracts per signal
+ORDER_EXPIRY_SECONDS = int(os.getenv("ORDER_EXPIRY_SECONDS", "300"))  # 5 min default

@@ -78,6 +78,12 @@ def get_markets(series_ticker: str, status: str = "open") -> list[dict]:
     return markets
 
 
+def get_market(ticker: str) -> dict:
+    """Fetch a single market's details (including result after settlement)."""
+    data = authenticated_request("GET", f"/trade-api/v2/markets/{ticker}")
+    return data.get("market", {})
+
+
 def get_orderbook(ticker: str, depth: int = 1) -> dict:
     """Fetch orderbook for a specific ticker.
 

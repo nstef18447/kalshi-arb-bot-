@@ -1,6 +1,11 @@
 .env
+.env.*
 *.pem
 __pycache__/
 *.pyc
 .venv/
 venv/
+*.db
+*.db-shm
+*.db-wal
+scan_output*.txt

@@ -50,7 +50,7 @@ db.init_db()
 st.sidebar.title("Kalshi Arb Bot")
 page = st.sidebar.radio(
     "Page",
-    ["Overview", "Ladder Explorer", "Cross-Strike Matrix", "Trade Log", "Competition Signals"],
+    ["Overview", "Ladder Explorer", "Cross-Strike Matrix", "Trade Log", "Competition Signals", "Paper Trades"],
 )
 
 st.sidebar.markdown("---")
@@ -681,6 +681,268 @@ def page_competition_signals():
             st.plotly_chart(fig_tod, use_container_width=True)
 
 
+# ══════════════════════════════════════════════════════════════════
+# PAGE 6: PAPER TRADES
+# ══════════════════════════════════════════════════════════════════
+
+def page_paper_trades():
+    st.title("Paper Trades — Mispricing Scanner")
+    _show_refresh()
+
+    # Auto-refresh every 60s
+    if "paper_last_refresh" not in st.session_state:
+        st.session_state.paper_last_refresh = time.time()
+    if time.time() - st.session_state.paper_last_refresh > 60:
+        st.session_state.paper_last_refresh = time.time()
+        st.rerun()
+
+    summary_df = queries.get_paper_trade_summary()
+    if summary_df.empty or summary_df.iloc[0]["total_trades"] == 0:
+        _empty_state(
+            "No paper trades yet. Run the bot with MODE=mispricing_scanner to start collecting signals. "
+            "Each signal is recorded as a hypothetical SELL YES trade."
+        )
+        return
+
+    s = summary_df.iloc[0]
+    total = int(s["total_trades"])
+    open_count = int(s["open_trades"])
+    resolved = int(s["resolved_trades"])
+    wins = int(s["wins"])
+    losses = int(s["losses"])
+    win_rate = (wins / resolved * 100) if resolved > 0 else 0
+
+    # Days of data
+    first_ts = s["first_trade_ts"]
+    last_ts = s["last_trade_ts"]
+    days_running = max(1, (last_ts - first_ts) / 86400) if first_ts and last_ts else 0
+
+    # ── Top-level metrics ──
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("Total Signals", f"{total:,}", delta=f"{open_count} open")
+    m2.metric("Resolved", f"{resolved:,}")
+    m3.metric("Win / Loss", f"{wins} / {losses}")
+    m4.metric("Win Rate", f"{win_rate:.1f}%" if resolved > 0 else "N/A")
+    m5.metric("Cumulative P&L", f"{int(s['total_pnl']):+,}c" if resolved > 0 else "N/A")
+    m6.metric("Avg Edge at Entry", f"{s['avg_edge_at_entry']:.1f}c")
+
+    if days_running > 0:
+        st.caption(f"Tracking for {days_running:.1f} days — need 14 days before going live")
+        progress = min(1.0, days_running / 14)
+        st.progress(progress, text=f"{days_running:.1f} / 14 days")
+
+    st.markdown("---")
+
+    # ── Breakdown by signal type ──
+    col_type, col_cat = st.columns(2)
+
+    with col_type:
+        st.subheader("By Signal Type")
+        type_df = queries.get_paper_trades_by_signal_type()
+        if not type_df.empty:
+            display = type_df.copy()
+            display["win_rate"] = display.apply(
+                lambda r: f"{r['wins'] / r['resolved'] * 100:.0f}%" if r["resolved"] > 0 else "—", axis=1
+            )
+            display["avg_pnl"] = display["avg_pnl"].apply(lambda x: f"{x:+.1f}c")
+            display["avg_edge"] = display["avg_edge"].apply(lambda x: f"{x:.1f}c")
+            display["pnl"] = display["pnl"].apply(lambda x: f"{int(x):+,}c")
+            st.dataframe(
+                display[["signal_type", "total", "resolved", "wins", "losses",
+                          "win_rate", "pnl", "avg_pnl", "avg_edge"]].rename(columns={
+                    "signal_type": "Type",
+                    "total": "Total",
+                    "resolved": "Resolved",
+                    "wins": "W",
+                    "losses": "L",
+                    "win_rate": "Win%",
+                    "pnl": "P&L",
+                    "avg_pnl": "Avg P&L",
+                    "avg_edge": "Avg Edge",
+                }),
+                use_container_width=True, hide_index=True,
+            )
+        else:
+            _empty_state("No signal type data yet.")
+
+    with col_cat:
+        st.subheader("By Category")
+        cat_df = queries.get_paper_trades_by_category()
+        if not cat_df.empty:
+            display = cat_df.copy()
+            resolved_total = display["wins"] + display["losses"]
+            display["win_rate"] = display.apply(
+                lambda r: f"{r['wins'] / (r['wins'] + r['losses']) * 100:.0f}%"
+                if (r["wins"] + r["losses"]) > 0 else "—", axis=1
+            )
+            display["pnl"] = display["pnl"].apply(lambda x: f"{int(x):+,}c")
+            display["avg_edge"] = display["avg_edge"].apply(lambda x: f"{x:.1f}c")
+            st.dataframe(
+                display[["category", "total", "wins", "losses", "win_rate", "pnl", "avg_edge"]].rename(columns={
+                    "category": "Category",
+                    "total": "Total",
+                    "wins": "W",
+                    "losses": "L",
+                    "win_rate": "Win%",
+                    "pnl": "P&L",
+                    "avg_edge": "Avg Edge",
+                }),
+                use_container_width=True, hide_index=True,
+            )
+        else:
+            _empty_state("No category data yet.")
+
+    st.markdown("---")
+
+    # ── Equity curve ──
+    cum_df = queries.get_paper_cumulative_pnl()
+    if not cum_df.empty and len(cum_df) >= 2:
+        st.subheader("Cumulative P&L (Resolved Trades)")
+        cum_df["time"] = pd.to_datetime(cum_df["timestamp"], unit="s")
+        fig_equity = px.line(
+            cum_df, x="time", y="cumulative_pnl",
+            labels={"cumulative_pnl": "Cumulative P&L (cents)", "time": ""},
+            color_discrete_sequence=["#a6e3a1"],
+        )
+        fig_equity.add_hline(y=0, line_dash="dash", line_color="grey")
+        fig_equity.update_layout(height=350, margin=dict(t=20, b=40))
+        st.plotly_chart(fig_equity, use_container_width=True)
+    elif resolved > 0:
+        st.info(f"Only {resolved} resolved trade(s) — equity curve appears after 2+.")
+
+    st.markdown("---")
+
+    # ── Threshold sensitivity (near-miss analysis) ──
+    st.subheader("Threshold Sensitivity — Near Misses")
+    st.caption(
+        "Signals that were close to firing but below threshold. "
+        "Use this to evaluate whether loosening or tightening thresholds would improve results."
+    )
+
+    nm_summary = queries.get_near_miss_summary()
+    nm_dist = queries.get_near_miss_gap_distribution()
+
+    col_nm_table, col_nm_chart = st.columns(2)
+
+    with col_nm_table:
+        if not nm_summary.empty:
+            display = nm_summary.copy()
+            display["avg_gap"] = display["avg_gap"].apply(lambda x: f"{x:.1f}c")
+            display["avg_price"] = display["avg_price"].apply(lambda x: f"{x:.0f}c")
+            st.dataframe(
+                display[["signal_type", "threshold_used", "near_miss_count",
+                          "avg_gap", "min_gap", "max_gap", "avg_price"]].rename(columns={
+                    "signal_type": "Type",
+                    "threshold_used": "Threshold",
+                    "near_miss_count": "Count",
+                    "avg_gap": "Avg Gap",
+                    "min_gap": "Min Gap",
+                    "max_gap": "Max Gap",
+                    "avg_price": "Avg Price",
+                }),
+                use_container_width=True, hide_index=True,
+            )
+        else:
+            _empty_state("No near-misses recorded yet.")
+
+    with col_nm_chart:
+        if not nm_dist.empty:
+            fig_nm = px.histogram(
+                nm_dist, x="gap", color="signal_type",
+                nbins=20,
+                labels={"gap": "Gap (cents below threshold)", "signal_type": "Type"},
+                color_discrete_sequence=["#fab387", "#89b4fa", "#a6e3a1"],
+                barmode="overlay",
+                opacity=0.7,
+            )
+            fig_nm.update_layout(
+                height=300, margin=dict(t=20, b=40),
+                xaxis_title="Gap (cents)", yaxis_title="Count",
+            )
+            st.plotly_chart(fig_nm, use_container_width=True)
+        else:
+            _empty_state("No near-miss distribution data yet.")
+
+    st.markdown("---")
+
+    # ── Full trade table ──
+    st.subheader("All Paper Trades")
+
+    trades_df = queries.get_paper_trades_all()
+    if not trades_df.empty:
+        # Filters
+        filter_col1, filter_col2 = st.columns(2)
+        with filter_col1:
+            status_filter = st.selectbox("Status", ["All", "Open", "Resolved"], key="paper_status")
+        with filter_col2:
+            type_options = trades_df["signal_type"].unique().tolist()
+            type_filter = st.multiselect("Signal type", type_options, default=type_options, key="paper_type")
+
+        filtered = trades_df.copy()
+        if status_filter == "Open":
+            filtered = filtered[filtered["status"] == "open"]
+        elif status_filter == "Resolved":
+            filtered = filtered[filtered["status"] == "resolved"]
+        filtered = filtered[filtered["signal_type"].isin(type_filter)]
+
+        display = filtered.copy()
+        display["time"] = pd.to_datetime(display["timestamp"], unit="s").dt.strftime("%m/%d %H:%M")
+        display["resolved_time"] = display["resolved_at"].apply(
+            lambda x: pd.to_datetime(x, unit="s").strftime("%m/%d %H:%M") if pd.notna(x) and x else "—"
+        )
+        display["pnl_display"] = display["pnl_cents"].apply(
+            lambda x: f"{int(x):+d}c" if pd.notna(x) else "—"
+        )
+
+        display_cols = [
+            "time", "signal_type", "series_ticker", "bucket_label",
+            "entry_price", "fair_value_est", "overpricing_gap",
+            "status", "resolved_price", "pnl_display", "resolved_time",
+        ]
+        st.dataframe(
+            display[display_cols].rename(columns={
+                "time": "Signal Time",
+                "signal_type": "Type",
+                "series_ticker": "Series",
+                "bucket_label": "Bucket",
+                "entry_price": "Sell@",
+                "fair_value_est": "Fair Val",
+                "overpricing_gap": "Gap",
+                "status": "Status",
+                "resolved_price": "Settled@",
+                "pnl_display": "P&L",
+                "resolved_time": "Resolved",
+            }),
+            use_container_width=True, hide_index=True, height=400,
+        )
+
+    # ── Recent near-misses ──
+    with st.expander("Recent Near-Misses (last 50)"):
+        nm_recent = queries.get_near_misses_recent(50)
+        if not nm_recent.empty:
+            nm_display = nm_recent.copy()
+            nm_display["time"] = pd.to_datetime(nm_display["timestamp"], unit="s").dt.strftime("%m/%d %H:%M")
+            nm_display_cols = [
+                "time", "signal_type", "series_ticker", "bucket_label",
+                "yes_price", "fair_value_est", "gap", "threshold_used",
+            ]
+            st.dataframe(
+                nm_display[nm_display_cols].rename(columns={
+                    "time": "Time",
+                    "signal_type": "Type",
+                    "series_ticker": "Series",
+                    "bucket_label": "Bucket",
+                    "yes_price": "YES Price",
+                    "fair_value_est": "Fair Val",
+                    "gap": "Gap",
+                    "threshold_used": "Threshold",
+                }),
+                use_container_width=True, hide_index=True, height=300,
+            )
+        else:
+            _empty_state("No near-misses recorded yet.")
+
+
 # ── Router ────────────────────────────────────────────────────────
 
 PAGES = {
@@ -689,6 +951,7 @@ PAGES = {
     "Cross-Strike Matrix": page_cross_strike_matrix,
     "Trade Log": page_trade_log,
     "Competition Signals": page_competition_signals,
+    "Paper Trades": page_paper_trades,
 }
 
 PAGES[page]()

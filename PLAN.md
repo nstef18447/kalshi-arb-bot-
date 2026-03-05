@@ -1,485 +1,350 @@
-# Kalshi Multi-Series Arb Bot + Market Maker — Project Plan
+# Kalshi Arb Bot — Project Plan
 
-## Current Status (2026-02-26)
+## Current Status (2026-03-04, evening update)
 
-### What's Built & Running
-The system runs **two modes** on a DigitalOcean droplet (`159.65.44.106`):
+### What's Running
+**Mispricing scanner** on DigitalOcean droplet (`159.65.44.106`), live since 2026-03-01 01:53 UTC.
+- `MODE=mispricing_scanner`, `READ_ONLY=true`
+- Paper trade tracking with **DB-backed deduplication** — one trade per bucket_ticker, 24h cooldown
+- Resolution checker runs every 5 minutes to settle paper trades
+- Near-miss tracker captures signals within 50-99% of threshold for sensitivity analysis
+- **Liquidity filters** (added 2026-03-04): `bid_depth >= 5` AND `spread <= 30c` required for paper trades
+- **352 resolved trades | +$30.44 | 83% win rate (292W/60L)** — past 500-trade target
+- Bid/ask/spread/bid_depth tracking deployed to droplet (was local-only before this session)
 
-1. **Arb Scanner** (MODE=read_only or MODE=arb) — scans 8 series for cross-strike arbitrage
-2. **Market Maker** (MODE=market_maker) — quotes bid/ask on ATM KXBTCD strikes, captures spread P&L
+**Account:** ~$41.44 balance (market maker stopped with 2 tiny positions that will settle on their own)
 
-Currently running **LIVE** (`MM_CONFIRM=true`, `MM_QUOTE_SIZE=2`) since 2026-02-26. Multi-expiry tiered quoting active (hourly preferred > daily fallback > weekly exit-only). Phase 2.1 improvements: volatility-adaptive spread, smart requoting, volatility pause. Position reconciliation and fill-safe strike rotation deployed.
+### Paper Trade Deduplication (added 2026-03-01)
+The original scanner logged a new paper trade every scan cycle for the same bucket — produced 3,076 rows in 15 hours for only 107 unique tickers. Fixed with:
+- **DB-level dedup**: `has_open_or_recent_paper_trade(bucket_ticker)` checks for open trades OR any trade within 24h
+- **Cleanup**: deleted 2,969 duplicate rows, kept earliest entry per bucket_ticker
+- **Raw signals still logged**: `mispricing_signals` table gets every detection (for frequency/persistence analysis), but `paper_trades` only gets one per bucket
+- New paper trades only appear for genuinely new bucket_tickers or after 24h cooldown post-resolution
 
-### Architecture
+### After Dedup — 107 Unique Paper Trades
+| Signal Type | Trades | Avg Gap |
+|-------------|--------|---------|
+| crypto_range | 93 | 54.0c |
+| fed_base_rate | 14 | 39.6c |
+
+| Series | Trades |
+|--------|--------|
+| KXETH | 42 |
+| KXSOLE | 35 |
+| KXBTC | 16 |
+| KXFEDDECISION | 14 |
+
+Near misses: 1,584 (crypto_range: 1,338, fed_base_rate: 160, proportional: 86)
+
+### Previous Mode (Market Maker)
+Market maker was running KXBTCD-only since 2026-02-27. Stopped to switch to mispricing scanner mode.
+- `.env.mm_backup2` saved on droplet for easy restore
+- To restore: `cp /opt/kalshi-arb-bot/.env.mm_backup2 /opt/kalshi-arb-bot/.env && systemctl restart kalshi-bot`
+
+---
+
+## Mispricing Scanner Architecture
+
+### Strategy
+Inspired by Polymarket wallet 0x8e9e's framework: find multi-outcome markets where YES prices sum to significantly more than $1.00, identify which specific buckets are overpriced relative to fair value, and flag SELL YES signals.
+
+### How It Works
+
 ```
-Bot (systemd: kalshi-bot)         Dashboard (not yet deployed)
-  MODE=arb:                           dashboard.py (Streamlit)
-    bot.py -> scanner.py              queries.py (read)
-  MODE=market_maker:                     |
-    mm_engine.py -> mm_config.py         |
-    mm_logger.py (write)                 |
-         \                             /
-          -----> arb_bot.db <---------
-                (WAL mode)
+Scanner Loop (5s cycle)
+  ├── For each series (poll at configured interval):
+  │   ├── Fetch events → markets → orderbooks
+  │   ├── Build EventSnapshot (buckets, YES sum, excess)
+  │   ├── Filter out cumulative/threshold markets (safety check)
+  │   ├── Estimate fair values (model-dependent)
+  │   ├── Detect mispricings → signals + near-misses
+  │   ├── Log ALL signals to mispricing_signals (raw, no dedup)
+  │   ├── Log paper_trades only if:
+  │   │     - No open/recent trade for that bucket (DB dedup + 24h cooldown)
+  │   │     - bid_depth >= 5 (something to sell into)
+  │   │     - spread <= 30c (liquid enough to trade)
+  │   └── Log near-misses (in-memory 10min cooldown)
+  └── Resolution checker (every 5 min):
+      ├── Fetch open paper trades
+      ├── Check settled markets via Kalshi API
+      └── Resolve: P&L = entry_price if result="no", -(100-entry_price) if result="yes"
 ```
 
-### File Inventory
+### Series Monitored
+
+| Series | Category | Poll Interval | Market Type |
+|--------|----------|---------------|-------------|
+| KXBTC | crypto | 30s | Range buckets (daily) |
+| KXETH | crypto | 30s | Range buckets (daily) |
+| KXSOLE | crypto | 30s | Range buckets (daily) |
+| KXFEDDECISION | economics | 120s | Exclusive outcomes (5 per meeting) |
+| KXRATECUTCOUNT | economics | 300s | Exclusive outcomes (21 buckets) |
+| KXBALANCEPOWERCOMBO | politics | 300s | Exclusive outcomes (4 combos) |
+
+**Excluded:** KXCPIYOY, KXCPICOREYOY, KXGDP — cumulative "above X%" markets where YES prices naturally sum to 400-800c. The $1.00-sum property does not apply.
+
+### Fair Value Models
+
+| Model | Used For | How It Works |
+|-------|----------|--------------|
+| **Fed base rate** | KXFEDDECISION (>90 days out) | Historical FOMC frequencies: hold=55%, cut 25bp=25%, hike 25bp=12%, etc. |
+| **Proportional** | All others with total YES > 100c | Scale market prices down so they sum to 100c. Flags buckets carrying disproportionate vig. |
+| **Center-weighted** | Fallback (total YES ≤ 100c) | Triangle distribution peaking at center bucket. |
+
+Near-term Fed meetings (<90 days) use proportional model instead — market consensus dominates historical base rates.
+
+### Signal Types & Thresholds
+
+| Signal Type | Threshold | Near-Miss Floor | Used For |
+|-------------|-----------|-----------------|----------|
+| `fed_base_rate` | 15c | 8c | KXFEDDECISION (>90 days) |
+| `crypto_range` | 7c | 4c | KXBTC, KXETH, KXSOLE |
+| `proportional` | 7c | 4c | Everything else |
+
+### Paper Trade P&L
+
+For each signal, we record a hypothetical **SELL YES** at the current price:
+- If market resolves **NO** (YES=0c): P&L = +entry_price (we sold something worthless)
+- If market resolves **YES** (YES=100c): P&L = -(100 - entry_price) (we sold something that paid out)
+- Example: Sell YES at 66c → if NO: +66c profit; if YES: -34c loss
+
+### Paper Trade Filters
+
+1. **One trade per bucket_ticker**: if `bucket_ticker` has an open (unresolved) paper trade → skip
+2. **24-hour cooldown**: if the most recent trade for that `bucket_ticker` (any status) was within 24h → skip
+3. **Liquidity: bid_depth >= 5**: must have at least 5 contracts across top 3 yes_bid levels to sell into
+4. **Liquidity: spread <= 30c**: bid-ask spread must be 30c or less — wider = illiquid/untradeable
+5. **Raw signals still logged**: `mispricing_signals` table captures every detection for frequency analysis (no filters)
+6. **Survives restarts**: dedup is DB-backed, not in-memory
+7. **Tradeable tag**: `tradeable` column (0/1) on paper_trades — retroactively set to 0 for trades with bid_depth<5 or spread>30
+
+### Cumulative Market Detection
+
+Safety check in `_fetch_event_snapshot()` to catch "above X" markets that slip through:
+- If total YES sum > 200c AND prices are ≥70% monotonically decreasing → skip
+- This caught BTC/ETH/SOL near-expiry events that were actually cumulative structure
+
+---
+
+## File Inventory
 
 | File | Purpose | Status |
 |------|---------|--------|
 | `auth.py` | RSA-PSS signing, authenticated requests | Done |
-| `config.py` | Mode selector, per-series fees, READ_ONLY flag | Done |
-| `kalshi_api.py` | API wrappers (markets, orderbook, orders, positions, open_orders) | Done |
-| `scanner.py` | Ladder builder, stale filter, opportunity detector (Type A/B/C) | Done |
-| `bot.py` | Arb scan loop, multi-series, maker profit, execution logic | Done |
-| `mm_config.py` | MM configuration from env vars (spread, vol, inventory, loss, tier cutoffs) | Done |
-| `mm_engine.py` | MarketMaker class — multi-expiry tiers, dynamic spread, smart requoting, vol pause, FIFO P&L, position reconciliation, exit-only strikes | Done |
-| `mm_logger.py` | DB logging for MM (quotes, fills, snapshots) | Done |
-| `main.py` | Entry point, branches on MODE for arb vs market_maker | Done |
-| `db.py` | SQLite schema (7 tables), migrations, connection helpers | Done |
-| `db_logger.py` | Arb scanner write helpers + maker summary query | Done |
-| `queries.py` | SQL queries for dashboard (returns DataFrames) | Done |
-| `monitor.py` | CLI monitoring script (DB + API, --compact mode) | Done |
-| `sports_scan.py` | Sports market feasibility scanner | Done |
-| `sports_feasibility.md` | Sports MM feasibility report (verdict: not viable) | Done |
-| `dashboard.py` | 5-page Streamlit app | Done (not deployed) |
+| `config.py` | Mode selector, per-series fees, READ_ONLY flag, mispricing thresholds, LIVE_EXECUTION + ORDER_SIZE + ORDER_EXPIRY_SECONDS | Done |
+| `kalshi_api.py` | API wrappers + `get_market()` for resolution checking | Done |
+| `mispricing_scanner.py` | MispricingScanner class, fair value models, paper trade logging, resolution checker, DB-backed dedup, bid/ask/spread tracking, adjusted P&L, live execution via limit orders | Done |
+| `db.py` | SQLite schema (15 tables), migrations, connection helpers | Done |
+| `db_logger.py` | Write helpers for all tables + `has_open_or_recent_paper_trade()` dedup check | Done |
+| `queries.py` | SQL queries for dashboard (original 5 pages + paper trades page) | Done |
+| `dashboard.py` | 6-page Streamlit app (added Paper Trades page) | Done |
+| `main.py` | Entry point, all 4 modes (arb, market_maker, binary_arb, mispricing_scanner) | Done |
+| `mm_engine.py` | MarketMaker class — full engine with all protections | Done (paused) |
+| `mm_config.py` | MM config from env vars | Done (paused) |
+| `scanner.py` | Arb ladder builder + opportunity detector | Done |
+| `bot.py` | Arb scan loop, multi-series, maker profit, execution | Done |
 | `deploy.sh` | Deployment script (systemd setup) | Done |
 
-### Deployment Details
+### Database Tables
+
+**Paper trade tracking:**
+- `paper_trades` — signal_type, entry_price, fair_value_est, overpricing_gap, status (open/resolved), resolved_price, pnl_cents, yes_bid, yes_ask, spread, bid_depth, adjusted_pnl_cents, tradeable (0/1)
+- `paper_near_misses` — yes_price, fair_value_est, gap, threshold_used (for sensitivity analysis)
+
+**Mispricing signals:**
+- `mispricing_signals` — raw signal log (event, bucket, price, fair value, gap, yes_bid, yes_ask, spread, bid_depth) — NOT deduped, logs every detection
+
+**Live execution:**
+- `live_orders` — order_id, bucket_ticker, price_cents, count, status (open/cancelled/filled), filled_count, filled_price, expires_at
+
+**Original arb/MM tables:**
+- `scans`, `ladder_snapshots`, `opportunities`, `trades`, `arb_stability`
+- `binary_arb_trades`, `mm_quotes`, `mm_fills`, `mm_snapshots`
+
+---
+
+## Dashboard — Paper Trades Page
+
+### Metrics
+- Total signals, open/resolved counts, W/L record, win rate
+- Cumulative P&L, average edge at entry
+- 14-day progress bar (countdown to going live)
+
+### Breakdowns
+- **By signal type**: fed_base_rate / crypto_range / proportional — W/L/P&L each
+- **By category**: crypto / economics / politics
+
+### Charts
+- Cumulative P&L equity curve (resolved trades)
+- Near-miss gap distribution histogram (for threshold tuning)
+
+### Tables
+- Full paper trade table (filterable by status + signal type)
+- Near-miss summary (count, avg gap, min/max per signal type)
+- Recent near-misses (last 50, expandable)
+
+---
+
+## Deployment Details
+
 - **Droplet**: `ssh root@159.65.44.106`
 - **Bot path**: `/opt/kalshi-arb-bot`
-- **Repo**: `https://github.com/nstef18447/kalshi-arb-bot-.git`
-- **Service**: `systemd: kalshi-bot` (auto-restart, PYTHONUNBUFFERED=1)
-- **Env**: `.env` with `KALSHI_ENV=prod`, `MODE=market_maker`, `MM_CONFIRM=true`
-- **API**: `https://api.elections.kalshi.com/trade-api/v2` (production)
-- **Account**: ~$47.86 balance (started $50, ~$2.14 in stranded inventory + fees)
-- **Monitor**: `cd /opt/kalshi-arb-bot && ./venv/bin/python3 monitor.py [--compact]`
+- **Service**: `systemd: kalshi-bot` (auto-restart, enabled for boot)
+- **Logs**: `journalctl -u kalshi-bot -f`
+- **DB**: `/opt/kalshi-arb-bot/arb_bot.db` (76MB, SQLite WAL mode)
 
----
-
-## Market Maker Engine
-
-### Motivation
-MM simulation on KXBTCD showed $25 spread P&L over 5.3 days (97% from spread capture, not directional). The engine runs as an alternative mode alongside the arb scanner.
-
-### How It Works
-
-**Multi-expiry tiered strike selection (every 5 min):**
-- Fetch all KXBTCD markets, classify events by TTL:
-  - **Hourly** (TTL < 2h): always quote — prefer shortest TTL
-  - **Daily** (TTL 2h–26h): quote only if fewer than 2 hourly strikes active
-  - **Weekly** (TTL > 26h): never open new positions, exit-only for existing inventory
-- Within each tier: probe ~10 middle strikes, find ATM (best yes bid nearest 50c)
-- Select ATM + 1 above + 1 below = 3 strikes per event
-- On startup: print available events table with tier, TTL, spread, and quotable status
-- `_pick_atm_from_events()`: extracted helper for per-tier ATM finding
-
-**Exit-only strike management:**
-- Strikes with inventory that leave the active ATM set get `exit_only=True`
-- Exit-only strikes are kept stable — no churn from repeated fill-check/cancel/re-adopt
-- Always post the reducing side (ask if inv>0, bid if inv<0) regardless of book conditions
-- `_compute_exit_price()` falls back to partial book data or `last_mid` for exit pricing
-- Once inventory reaches zero, strike is cleanly removed
-
-**Position reconciliation (startup):**
-- Query Kalshi `get_positions()` API
-- For tracked tickers: update inventory if mismatched
-- For untracked tickers: create StrikeState and adopt (exit-only)
-- Runs after stale order cancellation
-
-**Fill-safe strike rotation:**
-- `_cancel_if_active` checks fills BEFORE cancelling and again if cancel fails
-- `_handle_removed_strikes` does final `_check_fills` on every newly removed strike
-- Prevents stranded positions from fills between last check and strike removal
-
-**Volatility tracking (every 5s cycle):**
-- Sample contract midprice from ATM strike's orderbook (not BTC spot)
-- Record `(timestamp, midprice)` in rolling deque (max 60 entries)
-- Record `(timestamp, atm_strike_value)` for BTC % move detection
-- Calculate stdev of mid[t] - mid[t-1] changes over last 60 scans
-- EMA smoothing: `ema_vol = alpha * raw_stdev + (1 - alpha) * ema_vol` (alpha=0.3)
-
-**Dynamic spread (Phase 2.1):**
-- `dynamic_half_spread = max(base, math.ceil(ema_vol * multiplier))`
-- Capped at MM_MAX_HALF_SPREAD (15c = 30c total)
-- Requires >= 10 observations before computing (uses base until then)
-- Conservative rounding via math.ceil (wider is safer)
-
-**Quote computation (every 5s per strike):**
-- `mid = (best_yes_bid + (100 - best_no_bid)) / 2`
-- Inventory skew: `adjusted_mid = mid - (inventory * 1c)`
-- `target_bid = int(adjusted_mid - dynamic_half_spread)`
-- `target_ask = int(adjusted_mid + dynamic_half_spread)`
-- Safety clamps: don't cross book, 1 ≤ bid < ask ≤ 99
-- Skip if native spread < MM_MIN_BOOK_SPREAD (3c) — except for exit-only reducing side
-
-**Order mechanics (Kalshi-specific):**
-- **Bid** (buy Yes): `create_order(ticker, "yes", target_bid, size, post_only=True)`
-- **Ask** (sell Yes = buy No): `create_order(ticker, "no", 100 - target_ask, size, post_only=True)`
-- `post_only=True` ensures orders rest as maker (rejected if they'd cross spread)
-
-**Smart requoting (Phase 2.1 — queue priority preservation):**
-- KEEP existing order if ALL of:
-  - (a) Price within MM_QUOTE_TOLERANCE (2c) of target
-  - (b) Correct side of spread (bid < best ask, ask > best bid)
-  - (c) Not stale (resting < MM_STALE_QUOTE_SECONDS = 300s)
-  - (d) Still competitive (not behind best bid/ask for > 30s)
-- CANCEL AND REPLACE if any condition fails
-- Stale timer resets on partial fills
-- Tracks: requotes_skipped, requotes_needed, avg_queue_time
-
-**Fill detection (delta-based, with safety checks):**
-- Each cycle: `get_order(order_id)` for resting orders
-- Track `last_remaining` per order, only record `delta = last_remaining - remaining`
-- `_cancel_if_active` checks fills before cancelling, and again if cancel fails
-- When order fully filled/cancelled: clear order_id, reset tracking
-
-**FIFO P&L matching:**
-- yes_fills and no_fills deques per strike
-- Match oldest yes against oldest no: `profit = (100 - yes_price - no_price) * qty - fees`
-- Fees use maker_mult from config.SERIES (not hardcoded)
-
-**Volatility pause (Phase 2.1 — dual trigger):**
-- **Primary trigger**: contract midprice moves > 15c in 60s
-- **Backstop trigger**: ATM strike shifts > 0.3% of BTC price
-- On trigger: cancel all quotes, log "VOL PAUSE"
-- During pause: keep collecting midprice/ATM data (don't place orders)
-- Resume requires:
-  - Full lookback period (60s) elapsed since pause start
-  - Fresh post-pause data (>= 12 samples) shows calm
-  - Both triggers must be below thresholds using ONLY post-pause data
-
-**Circuit breakers:**
-- MAX_LOSS: total_realized_pnl < -MM_MAX_LOSS → halt, cancel all
-- MAX_INVENTORY: abs(inventory) >= limit → stop quoting the increasing side
-- API_ERRORS: consecutive_errors >= 5 → halt
-- NARROW_SPREAD: native spread < 3c → skip quoting (except exit-only)
-- VOL_PAUSE: large price move → pull all quotes until calm
-
-**Startup:**
-- Cancel all stale open orders from previous session
-- Reconcile positions from Kalshi API (adopt stranded inventory)
-- Print available events table by tier
-- Log starting balance
-
-**Shutdown (SIGTERM/SIGINT):**
-- `_stopped` guard prevents double-call
-- Cancel all resting orders (with fill check before each cancel)
-- Log final inventory + P&L per strike
-
-### MM Configuration
+### Current .env on droplet
 ```
-MODE=market_maker
-MM_SERIES=KXBTCD
-MM_HALF_SPREAD=5            # legacy (used as default for BASE_HALF_SPREAD)
-MM_QUOTE_SIZE=2              # 2 contracts per quote (live test size)
-MM_MAX_INVENTORY=5           # Max 5 contracts net position per strike
-MM_MAX_LOSS=2500             # $25 max loss
-MM_STRIKES=auto              # Auto-select ATM strikes
-MM_REQUOTE_INTERVAL=5        # Re-evaluate quotes every 5s
-MM_CONFIRM=true              # LIVE — real orders on Kalshi
-MM_QUOTE_TOLERANCE=2         # Don't requote if within 2c of target
-MM_MIN_BOOK_SPREAD=3         # Skip if native spread < 3c
-MM_MAX_API_ERRORS=5          # Halt after 5 consecutive errors
-
-# Multi-expiry tier system
-MM_MIN_EXPIRY=600            # 10 min minimum TTL
-MM_HOURLY_MAX_TTL=7200       # <2h = hourly tier (preferred)
-MM_DAILY_MAX_TTL=93600       # <26h = daily tier (fallback)
-MM_QUOTE_WEEKLY=false        # Don't open new positions on weekly events
-
-# Phase 2.1 — Volatility-adaptive spread
-MM_BASE_HALF_SPREAD=5        # Minimum half spread (cents)
-MM_VOL_MULTIPLIER=2.0        # How aggressively to widen on vol
-MM_MAX_HALF_SPREAD=15        # Cap (15c half = 30c total)
-MM_VOL_WINDOW=60             # Rolling window: 60 scans = 5 min
-MM_VOL_EMA_ALPHA=0.3         # EMA smoothing factor
-
-# Phase 2.1 — Volatility pause (dual trigger)
-MM_VOL_PAUSE_THRESHOLD=0.003 # 0.3% ATM strike move triggers pause
-MM_MID_MOVE_PAUSE=15         # 15c contract mid move triggers pause
-MM_VOL_PAUSE_LOOKBACK=12     # 12 scans = 60s lookback
-
-# Phase 2.1 — Smart requoting
-MM_STALE_QUOTE_SECONDS=300   # Cancel after 5min with no fills
-MM_COMPETITIVENESS_CHECK_AGE=30  # Requote if behind best for 30s
-```
-
-### MM DB Tables
-```sql
--- mm_quotes: every quote placement/cancel
-(id, timestamp, ticker, side, price, size, action)
-
--- mm_fills: detected fills with running P&L
-(id, timestamp, ticker, side, price, count, inventory_after, realized_pnl_cumulative)
-
--- mm_snapshots: per-cycle state per strike
-(id, timestamp, cycle, ticker, strike, bid_price, ask_price,
- inventory, strike_realized_pnl, total_realized_pnl)
-```
-
-### Bugs Fixed (2026-02-26)
-1. **Fill double-counting** — was re-reading total filled count each cycle; now tracks delta via `last_remaining`
-2. **Missing post_only** — orders could cross spread as taker (4x fees); now `post_only=True` on all MM orders
-3. **stop() double-call** — `_stopped` guard added
-4. **Hardcoded fees** — now pulled from `config.SERIES[MM_SERIES]`
-5. **No stale order cleanup** — startup now queries and cancels all open orders
-6. **ATM probe wrong** — was reading lowest yes level instead of best bid; fixed to `max()`
-7. **MAX_LOSS too high** — reduced from $50 to $25 to match balance
-8. **CRITICAL: Stranded fills on strike rotation** — fills between last check and strike removal went undetected. Fix: fill checks in `_cancel_if_active`, final fill checks in `_handle_removed_strikes`, position reconciliation on startup.
-9. **Exit-side not quoting** — when book empty or narrow spread, bot stopped quoting the exit side for inventory strikes. Fix: `_compute_exit_price` with `last_mid` fallback, always post reducing side.
-10. **Strike churn on exit-only** — constant "Final fill check / Keeping despite ATM shift" every 5 min interrupted quoting. Fix: `exit_only` flag makes strikes stable until inventory clears.
-
-### Phase 2.1 Improvements (2026-02-26)
-**Volatility-adaptive spread:**
-- Dynamic spread widens in volatile markets, floors at base
-- EMA smoothing (alpha=0.3) reduces spread jitter
-- math.ceil() for conservative rounding (wider is safer)
-- Requires >= 10 observations before computing stdev
-- Samples ATM strike specifically for consistent vol regime
-
-**Smart requoting (queue priority):**
-- Preserves queue priority — only cancel/replace when needed
-- Competitiveness check: requote if behind best bid/ask for > 30s
-- Stale timer resets on partial fills
-- Spread floor prevents penny wars
-
-**Volatility pause:**
-- Dual trigger: 15c contract mid move OR 0.3% ATM strike shift
-- Fresh-data resume: waits full lookback period, uses only post-pause data
-- Prevents adverse selection during sharp BTC moves
-
-### Multi-Expiry Tier System (2026-02-26)
-- Replaced single `MM_MAX_EXPIRY` with 3-tier priority: hourly > daily > weekly
-- Hourly events (TTL < 2h): always preferred, shortest TTL first
-- Daily events (TTL 2h-26h): fallback when < 2 hourly strikes available
-- Weekly events (TTL > 26h): exit-only, never open new positions
-- Startup prints available events table with tier, TTL, spread, quotable status
-
----
-
-## Sports Market Feasibility (2026-02-26) — REJECTED
-
-Full report: `sports_feasibility.md`
-
-**Key findings:**
-- 4,636 active events, 2,288 categorized as Sports
-- Top volume: Super Bowl futures (KXSB) — 882K contracts but **1c spreads**
-- Out of 6,000 sports markets scanned: **1** had both a bid and ask
-- 0 markets with spread >= 3c and meaningful volume
-- Game-day markets (NBA props, totals): **zero volume, empty orderbooks**
-- No above/below ladder structure — single yes/no outcomes only
-
-**Verdict: NOT VIABLE for market making.** Professional MMs have compressed sports spreads to 1-2c. No game-day liquidity. Wrong market structure (no strike ladders). Stick with crypto above/below.
-
----
-
-## Arb Scanner (Original Mode)
-
-### Series Being Scanned
-
-#### Above/below contracts — arb-eligible
-| Series | Underlying | Type | ~Markets | Durations | Schedule |
-|--------|-----------|------|----------|-----------|----------|
-| **KXBTCD** | Bitcoin | Above/below | 165 | 1h / 25h / 169h | 24/7 |
-| **KXETHD** | Ethereum | Above/below | 165 | 1h / 25h / 169h | 24/7 |
-| **KXSOLD** | Solana | Above/below | 200 | 1h / 25h / 169h | 24/7 |
-| **KXINXU** | S&P 500 | Above/below | 60 | 25h | US market hours |
-| **KXNASDAQ100U** | Nasdaq-100 | Above/below | 60 | 25h | US market hours |
-
-#### Range contracts — monitoring only
-| Series | Underlying | Type | ~Markets |
-|--------|-----------|------|----------|
-| KXBTC | Bitcoin | Range | 165 |
-| KXETH | Ethereum | Range | 165 |
-| KXSOLE | Solana | Range | 200 |
-
-### Key Decisions Made
-- **Above/below vs Range**: Cross-strike arb logic only works on above/below contracts. Range contracts have independent buckets.
-- **KXBTCD/KXETHD/KXSOLD**: The "D" suffix = directional (above/below). Primary arb targets.
-- **Events->Markets two-step**: Must fetch events first, then markets per event.
-- **Defense-in-depth READ_ONLY**: Guards at bot logic AND API layer.
-- **Production URL**: `api.elections.kalshi.com` (not `trading-api.kalshi.com`)
-- **Stale quote filter**: Depth < 10 or combined > 110 = phantom quotes
-- **close_time vs expiration_time**: Use `close_time` for TTL, not settlement time
-- **Per-series taker fees**: Parabolic `mult * P * (1-P)` per leg
-
----
-
-## Execution Logic (Arb Mode)
-
-### Pre-flight liquidity check
-- Both sides must have >= MIN_DEPTH (30) contracts at best ask
-
-### Leg the illiquid side first
-- Place thinner side first, wait FIRST_LEG_TIMEOUT (2s)
-- If fills → place second leg immediately
-- If not → cancel, zero exposure
-
-### Orphan fill recovery
-- If second leg fails within SECOND_LEG_TIMEOUT (3s):
-  - Cancel unfilled second leg
-  - Sell filled first leg at best bid
-  - Log realized P&L
-
-### Circuit breaker
-- Rolling window of 20 attempts
-- Orphan rate > 25% → pause 10 min
-
----
-
-## Config Variables (Arb Mode)
-```python
-MODE = os.getenv("MODE", "read_only").lower()
-READ_ONLY = MODE not in ("arb", "market_maker")
-
-ARB_THRESHOLD = 95            # Max combined price in cents
-MAX_CONTRACTS = 25            # Contracts per leg
-POLL_INTERVAL = 5             # Seconds between scan cycles
-MAX_EXPOSURE = 50000_00       # $50k max capital
-
-SERIES = {
-    "KXBTCD":       {"taker_fee": 0.07,  "maker_mult": 0.0175, "poll_every": 1, "contract_type": "above_below"},
-    "KXETHD":       {"taker_fee": 0.07,  "maker_mult": 0.0175, "poll_every": 1, "contract_type": "above_below"},
-    "KXSOLD":       {"taker_fee": 0.07,  "maker_mult": 0.0175, "poll_every": 1, "contract_type": "above_below"},
-    "KXINXU":       {"taker_fee": 0.035, "maker_mult": 0.00875, "poll_every": 6, "contract_type": "above_below"},
-    "KXNASDAQ100U": {"taker_fee": 0.035, "maker_mult": 0.00875, "poll_every": 6, "contract_type": "above_below"},
-    "KXBTC":        {"taker_fee": 0.07,  "maker_mult": 0.0175, "poll_every": 6, "contract_type": "range"},
-    "KXETH":        {"taker_fee": 0.07,  "maker_mult": 0.0175, "poll_every": 6, "contract_type": "range"},
-    "KXSOLE":       {"taker_fee": 0.07,  "maker_mult": 0.0175, "poll_every": 6, "contract_type": "range"},
-}
+KALSHI_API_KEY=<redacted>
+KALSHI_PRIVATE_KEY_PATH=/opt/kalshi-arb-bot/kalshi_private_key.pem
+KALSHI_ENV=prod
+MODE=mispricing_scanner
+READ_ONLY=true
+MISPRICING_THRESHOLD=15
+MISPRICING_MIN_EXCESS=5
 ```
 
 ---
 
-## DB Schema Reference
+## Paper Trade Results
 
-```sql
--- Arb scanner tables
-scans (id, timestamp, series_ticker, expiry_window, num_strikes, scan_duration_ms)
-ladder_snapshots (id, timestamp, series_ticker, expiry_window, strike, yes_ask, yes_bid, no_ask, no_bid, yes_depth, no_depth)
-opportunities (id, timestamp, series_ticker, expiry_window, opp_type, sub_type, strike_low, strike_high, yes_ask_low, no_ask_high, combined_cost, estimated_profit, estimated_profit_maker, btc_price_at_detection, time_to_expiry_seconds, depth_thin_side)
-trades (id, timestamp, expiry_window, opp_type, strike_low, strike_high, leg1_side, leg1_price, leg1_fill_status, leg2_side, leg2_price, leg2_fill_status, orphaned, exit_price, realized_pnl, fees)
-arb_stability (id, timestamp, series_ticker, expiry_window, strike_low, strike_high, combined_cost, depth_thin_side, first_seen, scan_count, status, close_reason)
+### 352 Resolved Trades (2026-03-04, latest)
 
--- Market maker tables
-mm_quotes (id, timestamp, ticker, side, price, size, action)
-mm_fills (id, timestamp, ticker, side, price, count, inventory_after, realized_pnl_cumulative)
-mm_snapshots (id, timestamp, cycle, ticker, strike, bid_price, ask_price, inventory, strike_realized_pnl, total_realized_pnl)
-```
+**Overall: +$30.44 | 83.0% win rate (292W / 60L)**
+- 525 total trades (352 resolved, 165 open)
+- All resolved trades are crypto_range — no fed/economics resolutions yet
+- Edge per trade: +8.65¢
+
+**Win Rate by Gap Size:**
+| Gap Bucket | Trades | Win % | Total P&L |
+|---|---|---|---|
+| 7-15¢ | 203 | 86% | +$5.56 |
+| 16-30¢ | 98 | 77% | +$0.90 |
+| 31-50¢ | 26 | 81% | +$5.16 |
+| 51¢+ | 25 | 84% | +$18.82 |
+
+**16-30¢ gap update:** Improved from net-negative (-$1.55 at 112 trades) to barely positive (+$0.90), but 77% win rate is right at breakeven threshold. Still the weakest bucket.
+
+**51¢+ signals are the moneymakers:** $18.82 from 25 trades = 75¢ avg profit per trade.
+
+**Liquidity filter impact:** 517 of 525 trades were logged before bid/ask tracking was deployed, so most have NULL spread/bid_depth. Going forward, new trades require bid_depth>=5 AND spread<=30c. Only 4 of 8 post-deploy trades were filtered out.
+
+### 36-Hour Results (2026-03-02, 112 resolved trades)
+
+**Overall: +$6.06 | 83% win rate (93W / 19L)**
+- Avg win: +20.7¢ | Avg loss: -69.5¢ | Edge per trade: +5.41¢
+- Breakeven win rate: ~77% → currently above breakeven
+
+**Position sizing projections (at paper edge of 5.41¢/trade, ~56 trades/day):**
+| Contracts/Signal | Daily P&L | Weekly | Monthly |
+|---|---|---|---|
+| 10 ($10/signal) | $30 | $212 | $908 |
+| 50 ($50/signal) | $151 | $1,060 | $4,540 |
+
+*Halve these estimates for realistic taker fills after bid/ask spread.*
+
+### First 15 Hours (2026-03-01, pre-dedup)
+- 3,076 raw paper trade rows → **107 unique bucket_tickers** after dedup cleanup
+- crypto_range dominates: 93 trades (ETH 42, SOL 35, BTC 16), avg gap 54c
+- fed_base_rate: 14 trades (all "Hike 0bps" on far-out FOMC meetings), avg gap 40c
+- 1,584 near-misses logged
+
+### Key Observations
+- Crypto range signals fire aggressively — BTC/ETH/SOL daily events have YES sums of 185-194c (85-94c excess)
+- The 7c threshold for crypto_range catches many buckets; most are small probabilities (10-20c) with proportional fair values of 5-10c
+- Fed "Hike 0bps" (hold) at 66-77c vs 26c historical base rate is the biggest gap signal
+- Proportional signals are rare (only 86 near-misses, 0 trades) — markets with lower excess don't produce big gaps
+- All 112 resolved trades are crypto_range — no fed/economics resolutions yet (first FOMC ~March 18-19)
 
 ---
 
 ## Next Steps
 
-### MM Live Test (current — started 2026-02-26)
-- [x] Set `MM_CONFIRM=true`, `MM_QUOTE_SIZE=2`
-- [x] Real orders resting on Kalshi (post_only confirmed)
-- [x] Fill detection bug found and fixed (stranded positions)
-- [x] Position reconciliation deployed and verified
-- [x] Exit-only strike management deployed (stable quoting)
-- [x] Multi-expiry tiers deployed (hourly > daily > weekly)
-- [x] Sports feasibility scan completed (not viable)
-- [ ] Monitor fills and P&L — currently unwinding stranded inventory (+2 T66499, +2 T68499)
-- [ ] Observe hourly event quoting behavior (books may be empty)
-- [ ] After inventory cleared + 24h stable: increase MM_QUOTE_SIZE to 5
-- [ ] Fund account to $100+ before scaling up
+### Completed
+- [x] Add paper trade deduplication (DB-backed, 24h cooldown)
+- [x] Clean up 2,969 duplicate rows
+- [x] First crypto resolutions — 112 resolved, 83% win rate, +$6.06
+- [x] Analyze P&L distribution and gap-size performance
+- [x] Reach 500 resolved trades — **352 resolved as of 2026-03-04** (525 total)
+- [x] Factor in bid/ask spread: log yes_bid alongside yes_ask for realistic taker P&L — DONE (2026-03-04)
+- [x] Compute adjusted_pnl_cents using yes_bid as entry — DONE (2026-03-04)
+- [x] Add liquidity filters: bid_depth>=5 AND spread<=30c — DONE (2026-03-04)
+- [x] Add `tradeable` column with retroactive tagging — DONE (2026-03-04)
+- [x] Deploy bid/ask tracking + liquidity filters to droplet — DONE (2026-03-04)
 
-### Observations & Issues
-- Hourly events (42min TTL) found but books often empty (bid=0 ask=0)
-- Daily events have 2c spreads (below MM_MIN_BOOK_SPREAD=3c)
-- Most fills happening on daily/weekly events with wider books
-- May need to lower MM_MIN_BOOK_SPREAD or adjust tier preference
+### Now (paper trading with liquidity filters active)
+- [ ] Validate 16-30¢ gap dead zone — currently 77% win rate, barely positive (+$0.90)
+- [ ] First Fed resolution expected: FOMC Mar 2026 meeting (~March 18-19)
+- [ ] Compare ask-based vs bid-based P&L once new trades resolve with bid data:
+  ```sql
+  SELECT COUNT(*), SUM(pnl_cents) as ask_pnl, SUM(adjusted_pnl_cents) as bid_pnl,
+    ROUND(100.0 * SUM(CASE WHEN adjusted_pnl_cents > 0 THEN 1 ELSE 0 END) / COUNT(*), 1) as adj_win_pct
+  FROM paper_trades WHERE status='resolved' AND adjusted_pnl_cents IS NOT NULL;
+  ```
+- [ ] Compare tradeable vs all P&L once enough new trades have bid/spread data
+- [ ] Decision: go live with real SELL YES orders, or refine model first?
 
-### Dashboard
-- [ ] Deploy Streamlit dashboard as second systemd service
-- [ ] Add MM-specific dashboard page (inventory, P&L, quote history)
-- [ ] Add spread/vol charts from mm_snapshots data
+### If Going Live
+- [x] Implement actual SELL YES order placement — DONE (2026-03-04, limit orders at yes_bid)
+- [x] Add ORDER_SIZE (10 contracts default) and ORDER_EXPIRY_SECONDS (5 min) config
+- [x] Add live_orders table for order tracking + expiry cancellation
+- [ ] Add position sizing logic (based on overpricing gap + depth)
+- [ ] Add max exposure limits per event/series
+- [ ] Fund account to $200+ for adequate margin
+- [ ] Keep paper trading alongside live to measure slippage
+- [ ] To activate: set `LIVE_EXECUTION=true` in .env (READ_ONLY must not be forced)
 
-### Future Improvements
-- [ ] Websocket feed instead of polling orderbooks (reduce API calls)
-- [ ] Multi-series MM (KXETHD, KXSOLD) — same above/below structure
-- [ ] Order flow imbalance detection (requires months of fill data)
-- [ ] Cross-strike inventory hedging (requires scale past $500/day)
-- [ ] Investigate Economics/Weather markets for MM opportunities
+### Model Improvements (ongoing)
+- [ ] Add CME FedWatch probabilities as dynamic fair value for Fed decisions
+- [ ] Use implied volatility or options data for crypto range fair values
+- [ ] Consider adding CPI/GDP back with cumulative-aware model
+- [ ] Track whether "hold" signals on far-out Fed meetings actually resolve profitably
 
 ---
 
-## Binary Arb Mode (MODE=binary_arb) — KXBTC15M
+## Historical Context
 
-### Overview
-Third mode added 2026-02-26. Scans KXBTC15M 15-minute binary contracts for same-market yes+no mispricing (combined ask < $1.00). When found, buys both sides to lock in risk-free profit. Based on friend's strategy (see `plan__1_.md` prospectus).
+### Market Maker Phase (2026-02-24 to 2026-03-01)
+- Built full market-making engine for KXBTCD + KXBTC15M
+- KXBTC15M disabled — structurally unprofitable (adverse selection on 15-min binaries)
+- KXBTCD ran at 8c spread, very low fill rate, roughly flat P&L
+- Total account loss: ~$8.56 (mostly KXBTC15M adverse selection)
 
-### Friend's Prospectus Claims
-- Starting balance $60,066, net gain ~$228 over 4 days (Feb 22–26)
-- 25 contracts per trade, threshold ≤96c
-- Opportunities appear 2–8 times per 15-minute window during active hours
-- Clean double-fills profitable; one-sided fills are primary loss source
-- 8-second hedge delay to check fill status, unwind one-sided fills
+### Polymarket Mirror Pipeline (2026-02-28)
+- Built wallet qualification pipeline for Polymarket tracker
+- Scored 4,151 wallets, qualified 41 mirror candidates
+- Deep profiled 3 wallets (0x8e9e, 0x397b, 0x66c1)
+- Key insight: wallet 0x8e9e's edge was "sell overpriced YES contracts" — not mechanical rules
+- This insight drove the pivot to the mispricing scanner approach
 
-### Files Added/Modified
-| File | Change |
-|------|--------|
-| `binary_arb_bot.py` | **NEW** — BinaryArbBot class, scan loop, execution, hedge checks |
-| `config.py` | Added `binary_arb` to READ_ONLY exclusion, KXBTC15M to SERIES, 4 new env vars |
-| `db.py` | Added `binary_arb_trades` table + indexes |
-| `db_logger.py` | Added `log_binary_arb_trade()` and `update_binary_arb_trade()` |
-| `main.py` | Added binary_arb branch, banner, `load_dotenv()` before config import, non-fatal balance check in READ_ONLY |
-| `investigate_kxbtc15m.py` | Investigation script for market structure + long-duration orderbook scanning |
+### Strategic Pivot (2026-02-28)
+- Shifted from "mirror wallet rules" to "detect overpriced outcomes"
+- Built mispricing scanner as new mode for kalshi-arb-bot
+- Fixed cumulative market detection, added Fed base rate model, proportional fair values
+- Added paper trade tracking + near-miss analysis
+- Deployed 2026-03-01 for 2-week evaluation period
 
-### Config Variables
-```python
-BINARY_ARB_THRESHOLD = int(os.getenv("BINARY_ARB_THRESHOLD", "96"))   # Max combined yes+no to trigger
-BINARY_ARB_SIZE = int(os.getenv("BINARY_ARB_SIZE", "10"))             # Contracts per side
-BINARY_ARB_COOLDOWN = int(os.getenv("BINARY_ARB_COOLDOWN", "30"))     # Seconds between trades on same ticker
-BINARY_ARB_HEDGE_DELAY = int(os.getenv("BINARY_ARB_HEDGE_DELAY", "8")) # Seconds before checking fills
-```
+### Dedup Fix (2026-03-01)
+- Discovered scanner was logging 3,076 paper trades for 107 unique tickers in 15 hours
+- Old dedup was 5-minute in-memory cooldown that reset on restart
+- Replaced with DB-backed dedup: `has_open_or_recent_paper_trade()` checks for open trades + 24h cooldown
+- Cleaned up duplicates, keeping earliest entry per bucket_ticker
 
-### READ_ONLY / Dry-Run Support
-- Added `READ_ONLY` env var override: `os.getenv("READ_ONLY", "").lower() in ("true", "1")`
-- Allows `MODE=binary_arb` + `READ_ONLY=true` for observation without trading
-- Dry-run prints every market's orderbook to stdout: ticker, yes_ask, no_ask, combined, depths, WOULD TRADE flag
-- Dry-run logs opportunities to `binary_arb_trades` with `hedge_action='dry_run'`
-- Balance check made non-fatal in READ_ONLY (demo API key can read prod market data but not portfolio)
+### Execution Reality Checks (2026-03-04)
+- Paper trading P&L used yes_ask as entry, but real SELL YES taker fills execute at yes_bid (lower = worse)
+- Added bid/ask/spread/bid_depth tracking to paper_trades and mispricing_signals
+- Orderbook depth increased from 1→3 levels for better liquidity picture
+- `yes_bid_depth` = total contracts across top 3 yes_bid levels (what we can sell into)
+- `adjusted_pnl_cents` computed on resolution using yes_bid as entry price
+- PAPER TRADE log now shows: `ask=Xc bid=Xc spread=Xc fair=Xc gap=+Xc | bid_depth=N`
+- Live execution ready: `LIVE_EXECUTION=true` places SELL YES limit orders at yes_bid price
+- Orders auto-cancel after ORDER_EXPIRY_SECONDS (default 5 min)
 
-### Bug Fixed: load_dotenv() ordering
-- `load_dotenv()` was called inside `main()` but `import config` happened at module top level
-- .env vars (MODE, READ_ONLY) weren't loaded when config.py evaluated
-- Fix: moved `load_dotenv()` before `import config` at top of main.py
-
-### Dry-Run Results (2026-02-26, ~22:47–23:01 UTC)
-
-#### Market Structure
-- **1 event, 1 market per 15-min window** — no overlapping windows, no multiple strikes
-- Ticker format: `KXBTC15M-{date}{HHMM}-{suffix}` (e.g., `KXBTC15M-26FEB261800-00`)
-- `market_type: binary`, `strike_type: greater_or_equal`
-- Question: "BTC price up in next 15 mins?" with a floor_strike (price to beat)
-- 15-min windows: open_time to close_time, settlement 60s after close
-- 7,018 settled events (huge history) — market has been running a while
-
-#### Orderbook Observations (~200 scans across 2 windows, 1s and 5s polling)
-- **Combined cost range: 101–108** (never below 101)
-- **Average: ~102**
-- **Zero opportunities at threshold ≤96** in entire observation period
-- Near expiry (last 60s of window): spread widens to 104–108, books thin
-- During window transition: ~15s gap with empty books before new window opens
-- New window opens with fresh price discovery near 50/50, combined ~101–103
-- Depths vary wildly: 1–11,000 contracts, median ~200–500
-- Price swings are real (yes went 62→5→28 in one window as BTC dropped) but spread stays 101+
-
-#### Assessment vs Friend's Claims
-- Friend claims 2–8 opps per window at ≤96c. We saw 0 in ~200 scans.
-- **Possible explanations:**
-  1. Friend runs on low-latency VPS — sub-second opportunities we can't catch even at 1s polling
-  2. Market conditions during our scan (Wed evening EST) may differ from friend's active period (weekday daytime)
-  3. The 1–2c spread (combined=101–102) may compress to 100 or below only during volatile moments we haven't captured yet
-  4. Friend's $228 over 4 days with $60k capital = 0.38% return — this is very thin, consistent with rare fleeting opportunities
-- **Need longer observation**: run on VPS at 1s polling for 24h+ to capture daytime volatility
-- **The spread floor of 101 is suspicious** — may indicate professional MMs keeping it above 100 with 1c edge
-
-### Next Steps (Binary Arb)
-- [ ] Run 24h+ scan from DigitalOcean droplet (lower latency, 1s polling)
-- [ ] Analyze results: does combined ever dip ≤98 during US market hours?
-- [ ] If no opportunities found: strategy may not be viable at our latency
-- [ ] If opportunities found: tune threshold, test with small size (5 contracts)
-- [ ] Consider: friend may have different fee tier or API access level
+### Liquidity Filters (2026-03-04)
+- Many paper trades had bid=1c, spread=97c, bid_depth=0 — completely untradeable in reality
+- Added two filters before logging paper trades (raw signals still logged unconditionally):
+  - `bid_depth >= 5` — must have contracts to sell into
+  - `spread <= 30c` — anything wider is illiquid
+- Added `tradeable` column (0/1) to paper_trades — retroactively tags old trades with bid/spread data
+- 517 of 525 trades were pre-deploy (NULL bid/spread), so retroactive tagging only caught 4 trades
+- Going forward all new trades will be filtered and properly tagged

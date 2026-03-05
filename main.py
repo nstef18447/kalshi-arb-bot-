@@ -80,6 +80,19 @@ def print_config():
         print(f"{'='*50}\n")
         return
 
+    if config.MODE == "mispricing_scanner":
+        from mispricing_scanner import MULTI_OUTCOME_SERIES, OVERPRICING_THRESHOLD_CENTS, MIN_TOTAL_EXCESS_CENTS
+        print(f"\n{'='*50}")
+        print(f"  Kalshi Mispricing Scanner — {env}")
+        print(f"{'='*50}")
+        print(f"  Series:          {list(MULTI_OUTCOME_SERIES.keys())}")
+        print(f"  Categories:      {sorted(set(s['category'] for s in MULTI_OUTCOME_SERIES.values()))}")
+        print(f"  Overpricing gap: {OVERPRICING_THRESHOLD_CENTS}c (flag if YES price > fair value + {OVERPRICING_THRESHOLD_CENTS}c)")
+        print(f"  Min event excess:{MIN_TOTAL_EXCESS_CENTS}c (only scan if total YES > {100 + MIN_TOTAL_EXCESS_CENTS}c)")
+        print(f"\n  MODE: READ-ONLY (signal logging only, no trading)")
+        print(f"{'='*50}\n")
+        return
+
     if config.MODE == "binary_arb":
         print(f"\n{'='*50}")
         print(f"  Kalshi Binary Arb Bot — {env}")
@@ -144,7 +157,17 @@ def main():
             print("  Check your API credentials and try again.")
             sys.exit(1)
 
-    if config.MODE == "market_maker":
+    if config.MODE == "mispricing_scanner":
+        from mispricing_scanner import MispricingScanner
+        scanner = MispricingScanner()
+        try:
+            scanner.start()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            scanner.stop()
+            print("\nMispricing scanner shut down cleanly.")
+    elif config.MODE == "market_maker":
         import mm_config as mc
         from mm_engine import MarketMaker
 

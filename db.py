@@ -133,6 +133,75 @@ CREATE TABLE IF NOT EXISTS mm_snapshots (
     strike_realized_pnl REAL NOT NULL DEFAULT 0,
     total_realized_pnl REAL NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS paper_trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp REAL NOT NULL,
+    event_ticker TEXT NOT NULL,
+    series_ticker TEXT NOT NULL,
+    event_title TEXT NOT NULL,
+    bucket_ticker TEXT NOT NULL,
+    bucket_label TEXT NOT NULL,
+    category TEXT NOT NULL,
+    signal_type TEXT NOT NULL,
+    entry_price INTEGER NOT NULL,
+    fair_value_est INTEGER NOT NULL,
+    overpricing_gap INTEGER NOT NULL,
+    total_event_excess INTEGER NOT NULL,
+    yes_depth INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'open',
+    resolved_price INTEGER,
+    pnl_cents INTEGER,
+    resolved_at REAL
+);
+
+CREATE TABLE IF NOT EXISTS paper_near_misses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp REAL NOT NULL,
+    event_ticker TEXT NOT NULL,
+    series_ticker TEXT NOT NULL,
+    bucket_ticker TEXT NOT NULL,
+    bucket_label TEXT NOT NULL,
+    category TEXT NOT NULL,
+    signal_type TEXT NOT NULL,
+    yes_price INTEGER NOT NULL,
+    fair_value_est INTEGER NOT NULL,
+    gap INTEGER NOT NULL,
+    threshold_used INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS mispricing_signals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp REAL NOT NULL,
+    event_ticker TEXT NOT NULL,
+    series_ticker TEXT NOT NULL,
+    event_title TEXT NOT NULL,
+    bucket_ticker TEXT NOT NULL,
+    bucket_label TEXT NOT NULL,
+    category TEXT NOT NULL,
+    current_price INTEGER NOT NULL,
+    fair_value_est INTEGER NOT NULL,
+    overpricing_gap INTEGER NOT NULL,
+    total_event_excess INTEGER NOT NULL,
+    yes_depth INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS live_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp REAL NOT NULL,
+    paper_trade_id INTEGER REFERENCES paper_trades(id),
+    order_id TEXT NOT NULL,
+    bucket_ticker TEXT NOT NULL,
+    side TEXT NOT NULL DEFAULT 'yes',
+    action TEXT NOT NULL DEFAULT 'sell',
+    price_cents INTEGER NOT NULL,
+    count INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    filled_count INTEGER DEFAULT 0,
+    filled_price INTEGER,
+    cancelled_at REAL,
+    expires_at REAL NOT NULL
+);
 """
 
 # Indexes — created after migrations so columns exist
@@ -160,6 +229,21 @@ CREATE INDEX IF NOT EXISTS idx_mm_fills_ts ON mm_fills(timestamp);
 CREATE INDEX IF NOT EXISTS idx_mm_fills_ticker ON mm_fills(ticker);
 CREATE INDEX IF NOT EXISTS idx_mm_snapshots_ts ON mm_snapshots(timestamp);
 CREATE INDEX IF NOT EXISTS idx_mm_snapshots_cycle ON mm_snapshots(cycle);
+CREATE INDEX IF NOT EXISTS idx_paper_ts ON paper_trades(timestamp);
+CREATE INDEX IF NOT EXISTS idx_paper_status ON paper_trades(status);
+CREATE INDEX IF NOT EXISTS idx_paper_series ON paper_trades(series_ticker);
+CREATE INDEX IF NOT EXISTS idx_paper_bucket ON paper_trades(bucket_ticker);
+CREATE INDEX IF NOT EXISTS idx_paper_category ON paper_trades(category);
+CREATE INDEX IF NOT EXISTS idx_paper_signal_type ON paper_trades(signal_type);
+CREATE INDEX IF NOT EXISTS idx_near_miss_ts ON paper_near_misses(timestamp);
+CREATE INDEX IF NOT EXISTS idx_near_miss_series ON paper_near_misses(series_ticker);
+CREATE INDEX IF NOT EXISTS idx_mispricing_ts ON mispricing_signals(timestamp);
+CREATE INDEX IF NOT EXISTS idx_mispricing_series ON mispricing_signals(series_ticker);
+CREATE INDEX IF NOT EXISTS idx_mispricing_bucket ON mispricing_signals(bucket_ticker);
+CREATE INDEX IF NOT EXISTS idx_mispricing_category ON mispricing_signals(category);
+CREATE INDEX IF NOT EXISTS idx_live_orders_ts ON live_orders(timestamp);
+CREATE INDEX IF NOT EXISTS idx_live_orders_status ON live_orders(status);
+CREATE INDEX IF NOT EXISTS idx_live_orders_bucket ON live_orders(bucket_ticker);
 """
 
 
@@ -197,6 +281,40 @@ def init_db():
         snap_cols = {row[1] for row in conn.execute("PRAGMA table_info(ladder_snapshots)").fetchall()}
         if "series_ticker" not in snap_cols:
             conn.execute("ALTER TABLE ladder_snapshots ADD COLUMN series_ticker TEXT NOT NULL DEFAULT 'KXBTC'")
+
+        # Mispricing scanner columns — paper_trades
+        pt_cols = {row[1] for row in conn.execute("PRAGMA table_info(paper_trades)").fetchall()}
+        for col, typedef in [
+            ("yes_bid", "INTEGER"),
+            ("yes_ask", "INTEGER"),
+            ("spread", "INTEGER"),
+            ("bid_depth", "INTEGER"),
+            ("adjusted_pnl_cents", "INTEGER"),
+            ("tradeable", "INTEGER NOT NULL DEFAULT 1"),
+        ]:
+            if col not in pt_cols:
+                conn.execute(f"ALTER TABLE paper_trades ADD COLUMN {col} {typedef}")
+
+        # Retroactively tag untradeable paper trades (bid_depth < 5 or spread > 30)
+        conn.execute("""
+            UPDATE paper_trades SET tradeable = 0
+            WHERE tradeable = 1
+              AND (
+                (bid_depth IS NOT NULL AND bid_depth < 5)
+                OR (spread IS NOT NULL AND spread > 30)
+              )
+        """)
+
+        # Mispricing scanner columns — mispricing_signals
+        ms_cols = {row[1] for row in conn.execute("PRAGMA table_info(mispricing_signals)").fetchall()}
+        for col, typedef in [
+            ("yes_bid", "INTEGER"),
+            ("yes_ask", "INTEGER"),
+            ("spread", "INTEGER"),
+            ("bid_depth", "INTEGER"),
+        ]:
+            if col not in ms_cols:
+                conn.execute(f"ALTER TABLE mispricing_signals ADD COLUMN {col} {typedef}")
 
         conn.commit()
 
