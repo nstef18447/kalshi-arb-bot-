@@ -283,7 +283,8 @@ def log_paper_trade(event_ticker, series_ticker, event_title,
                     bucket_ticker, bucket_label, category, signal_type,
                     entry_price, fair_value_est, overpricing_gap,
                     total_event_excess, yes_depth=0,
-                    yes_bid=None, yes_ask=None, spread=None, bid_depth=None):
+                    yes_bid=None, yes_ask=None, spread=None, bid_depth=None,
+                    filter_version="v1"):
     """Log a hypothetical SELL YES paper trade."""
     conn = db.get_connection()
     try:
@@ -293,13 +294,13 @@ def log_paper_trade(event_ticker, series_ticker, event_title,
             "bucket_ticker, bucket_label, category, signal_type, "
             "entry_price, fair_value_est, overpricing_gap, "
             "total_event_excess, yes_depth, "
-            "yes_bid, yes_ask, spread, bid_depth) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "yes_bid, yes_ask, spread, bid_depth, filter_version) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (time.time(), event_ticker, series_ticker, event_title,
              bucket_ticker, bucket_label, category, signal_type,
              entry_price, fair_value_est, overpricing_gap,
              total_event_excess, yes_depth,
-             yes_bid, yes_ask, spread, bid_depth),
+             yes_bid, yes_ask, spread, bid_depth, filter_version),
         )
         conn.commit()
     finally:

@@ -36,6 +36,17 @@ MULTI_OUTCOME_SERIES = {
     # Political multi-outcome
     "KXBALANCEPOWERCOMBO": {"category": "politics", "poll_every": 300, "label": "Congress Balance of Power"},
 }
+
+# ── Dynamic political series discovery ────────────────────────────────────
+# Political multi-outcome markets are discovered from the Kalshi API at startup
+# and refreshed periodically. Only mutually_exclusive events with 3+ markets
+# qualify. These use the proportional fair value model (same as crypto ranges)
+# and are tagged as signal_type="political" for independent evaluation.
+POLITICAL_CATEGORIES = {"politics", "elections"}
+POLITICAL_POLL_EVERY = 300       # seconds between scans for political series
+POLITICAL_REFRESH_INTERVAL = 1800  # seconds between discovery refreshes (30 min)
+MIN_POLITICAL_EXCESS = 5         # minimum YES sum excess (cents) to scan a political event
+MAX_POLITICAL_SERIES = 200       # cap discovery to avoid API rate limits
 # NOTE: KXCPIYOY, KXCPICOREYOY, KXGDP are EXCLUDED — they are cumulative
 # threshold markets ("above X%"), not mutually exclusive ranges. Their YES
 # prices naturally sum to 400-800c, not ~100c. The $1.00-sum property does
@@ -46,7 +57,14 @@ OVERPRICING_THRESHOLD_CENTS = config.MISPRICING_THRESHOLD   # Flag bucket if Kal
 MIN_TOTAL_EXCESS_CENTS = config.MISPRICING_MIN_EXCESS       # Only scan events where total YES sum > 100 + this
 MIN_BUCKETS = 3                    # Need at least 3 outcomes to be a valid multi-outcome
 MIN_BID_DEPTH = 5                  # Don't paper trade if < 5 contracts to sell into
-MAX_SPREAD = 30                    # Don't paper trade if bid-ask spread > 30c
+MAX_SPREAD = 15                    # Don't paper trade if bid-ask spread > 15c (tightened from 30c based on v1 analysis)
+
+# BTC gap exclusion zone: 10-29c gaps are net negative (-276c across 89 v1 trades).
+# Keep 5-9c (94% WR) and 30c+ for BTC. ETH/SOL unaffected.
+BTC_GAP_EXCLUSION_MIN = 10
+BTC_GAP_EXCLUSION_MAX = 29
+
+FILTER_VERSION = "v2"
 
 # ── Fair value models ────────────────────────────────────────────────────
 # Static base rates derived from historical data. These are starting points —
@@ -388,6 +406,8 @@ def _get_signal_type(event: EventSnapshot) -> str:
                 return "fed_base_rate"
     if event.category == "crypto":
         return "crypto_range"
+    if event.category in POLITICAL_CATEGORIES:
+        return "political"
     return "proportional"
 
 
@@ -449,6 +469,61 @@ def _detect_mispricings(event: EventSnapshot) -> tuple[list[MispricingSignal], l
     return signals, near_misses
 
 
+def _discover_political_series() -> dict[str, dict]:
+    """Discover political multi-outcome series from the Kalshi API.
+
+    Fetches all open events, filters for mutually_exclusive political/elections
+    events with 3+ markets, and returns a dict matching the MULTI_OUTCOME_SERIES
+    format: {series_ticker: {category, poll_every, label}}.
+
+    Caps at MAX_POLITICAL_SERIES to avoid API rate limits, prioritizing series
+    with more markets (more buckets = more overpricing opportunities).
+    """
+    candidates = []
+    try:
+        all_events = kalshi_api._paginate(
+            "/trade-api/v2/events",
+            {"status": "open", "limit": 200},
+            "events",
+        )
+    except Exception:
+        logger.warning("Failed to fetch events for political discovery")
+        return {}
+
+    # Group by series, keep only mutually exclusive political events
+    seen_series = set()
+    for ev in all_events:
+        series = ev.get("series_ticker", "")
+        if not series or series in seen_series:
+            continue
+        if not ev.get("mutually_exclusive", False):
+            continue
+        cat = (ev.get("category", "") or "").lower()
+        if cat not in POLITICAL_CATEGORIES:
+            continue
+        # Skip series already in the static config
+        if series in MULTI_OUTCOME_SERIES:
+            continue
+
+        seen_series.add(series)
+        title = ev.get("title", series)
+        n_markets = ev.get("markets_count", 0) or 0
+        candidates.append((series, cat, title, n_markets))
+
+    # Sort by market count descending — more buckets = more overpricing signal surface
+    candidates.sort(key=lambda x: x[3], reverse=True)
+    candidates = candidates[:MAX_POLITICAL_SERIES]
+
+    return {
+        series: {
+            "category": cat,
+            "poll_every": POLITICAL_POLL_EVERY,
+            "label": title[:80],
+        }
+        for series, cat, title, _ in candidates
+    }
+
+
 class MispricingScanner:
     """Main scanner loop for multi-outcome mispricing detection."""
 
@@ -457,6 +532,8 @@ class MispricingScanner:
         self.scan_count = 0
         self.last_poll: dict[str, float] = {}  # series -> last poll time
         self.last_resolution_check: float = 0  # monotonic time
+        self._last_political_refresh: float = 0  # monotonic time
+        self._political_series: dict[str, dict] = {}  # dynamically discovered
         self.stats = {
             "scans": 0,
             "events_checked": 0,
@@ -471,9 +548,28 @@ class MispricingScanner:
         self._recent_near_misses: dict[str, float] = {}
         self._near_miss_cooldown = 600  # 10 min between same-bucket near-miss logs
 
+    def _refresh_political_series(self):
+        """Discover or refresh political multi-outcome series."""
+        self._political_series = _discover_political_series()
+        self._last_political_refresh = time.monotonic()
+        logger.info(
+            "Political series discovery: %d series found",
+            len(self._political_series),
+        )
+
+    def _get_all_series(self) -> dict[str, dict]:
+        """Return combined static + dynamically discovered series."""
+        combined = dict(MULTI_OUTCOME_SERIES)
+        combined.update(self._political_series)
+        return combined
+
     def start(self):
         self.running = True
-        logger.info("Mispricing scanner started — monitoring %d series", len(MULTI_OUTCOME_SERIES))
+        self._refresh_political_series()
+        logger.info(
+            "Mispricing scanner started — monitoring %d static + %d political series",
+            len(MULTI_OUTCOME_SERIES), len(self._political_series),
+        )
         while self.running:
             try:
                 self._scan_cycle()
@@ -624,6 +720,13 @@ class MispricingScanner:
             except Exception:
                 logger.exception("Error checking paper trade resolutions")
 
+        # Refresh political series discovery every POLITICAL_REFRESH_INTERVAL
+        if now - self._last_political_refresh >= POLITICAL_REFRESH_INTERVAL:
+            try:
+                self._refresh_political_series()
+            except Exception:
+                logger.warning("Error refreshing political series", exc_info=True)
+
         # Check live order expiry every cycle
         if config.LIVE_EXECUTION and not config.READ_ONLY:
             try:
@@ -631,7 +734,7 @@ class MispricingScanner:
             except Exception:
                 logger.debug("Error checking order expiry")
 
-        for series_ticker, series_cfg in MULTI_OUTCOME_SERIES.items():
+        for series_ticker, series_cfg in self._get_all_series().items():
             poll_every = series_cfg.get("poll_every", 60)
             last = self.last_poll.get(series_ticker, 0)
             if now - last < poll_every:
@@ -709,6 +812,23 @@ class MispricingScanner:
                             )
                             continue
 
+                        # Bid-price guard: only trade if the bid we'd sell at exceeds fair value
+                        if sig.yes_bid <= sig.fair_value_est:
+                            logger.debug(
+                                "SKIP (bid <= fair value): %s | bid=%dc <= fv=%dc",
+                                sig.bucket_ticker, sig.yes_bid, sig.fair_value_est,
+                            )
+                            continue
+
+                        # BTC gap exclusion zone: 10-29c gaps are net negative
+                        if sig.series_ticker == "KXBTC" and BTC_GAP_EXCLUSION_MIN <= sig.overpricing_gap <= BTC_GAP_EXCLUSION_MAX:
+                            logger.debug(
+                                "SKIP (BTC gap exclusion): %s | gap=%dc in [%d-%d]c zone",
+                                sig.bucket_ticker, sig.overpricing_gap,
+                                BTC_GAP_EXCLUSION_MIN, BTC_GAP_EXCLUSION_MAX,
+                            )
+                            continue
+
                         self.stats["paper_trades"] += 1
 
                         logger.warning(
@@ -736,6 +856,7 @@ class MispricingScanner:
                             yes_ask=sig.yes_ask,
                             spread=sig.spread,
                             bid_depth=sig.bid_depth,
+                            filter_version=FILTER_VERSION,
                         )
 
                         # Live execution: place limit sell at yes_bid

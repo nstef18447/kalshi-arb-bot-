@@ -235,6 +235,7 @@ CREATE INDEX IF NOT EXISTS idx_paper_series ON paper_trades(series_ticker);
 CREATE INDEX IF NOT EXISTS idx_paper_bucket ON paper_trades(bucket_ticker);
 CREATE INDEX IF NOT EXISTS idx_paper_category ON paper_trades(category);
 CREATE INDEX IF NOT EXISTS idx_paper_signal_type ON paper_trades(signal_type);
+CREATE INDEX IF NOT EXISTS idx_paper_filter_version ON paper_trades(filter_version);
 CREATE INDEX IF NOT EXISTS idx_near_miss_ts ON paper_near_misses(timestamp);
 CREATE INDEX IF NOT EXISTS idx_near_miss_series ON paper_near_misses(series_ticker);
 CREATE INDEX IF NOT EXISTS idx_mispricing_ts ON mispricing_signals(timestamp);
@@ -291,6 +292,7 @@ def init_db():
             ("bid_depth", "INTEGER"),
             ("adjusted_pnl_cents", "INTEGER"),
             ("tradeable", "INTEGER NOT NULL DEFAULT 1"),
+            ("filter_version", "TEXT NOT NULL DEFAULT 'v1'"),
         ]:
             if col not in pt_cols:
                 conn.execute(f"ALTER TABLE paper_trades ADD COLUMN {col} {typedef}")

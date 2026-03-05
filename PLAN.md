@@ -1,6 +1,13 @@
 # Kalshi Arb Bot — Project Plan
 
-## Current Status (2026-03-04, evening update)
+## Current Status (2026-03-05)
+
+### Git & Deployment (added 2026-03-05)
+- **GitHub repo**: `nstef18447/kalshi-arb-bot-` on `master` branch
+- **Local → GitHub → Droplet** workflow: commit & push locally, `git pull` on droplet
+- All code committed and synced — no more scp deployments
+- `.gitignore` covers: `.env`, `.env.*`, `*.pem`, `*.db`, `*.db-shm`, `*.db-wal`, `scan_output*.txt`
+- **Deploy command**: `ssh root@159.65.44.106 "cd /opt/kalshi-arb-bot && git pull && systemctl restart kalshi-bot"`
 
 ### What's Running
 **Mispricing scanner** on DigitalOcean droplet (`159.65.44.106`), live since 2026-03-01 01:53 UTC.
@@ -271,6 +278,7 @@ MISPRICING_MIN_EXCESS=5
 - [x] Add liquidity filters: bid_depth>=5 AND spread<=30c — DONE (2026-03-04)
 - [x] Add `tradeable` column with retroactive tagging — DONE (2026-03-04)
 - [x] Deploy bid/ask tracking + liquidity filters to droplet — DONE (2026-03-04)
+- [x] Connect local repo + droplet to GitHub, commit all code, sync via git pull — DONE (2026-03-05)
 
 ### Now (paper trading with liquidity filters active)
 - [ ] Validate 16-30¢ gap dead zone — currently 77% win rate, barely positive (+$0.90)
