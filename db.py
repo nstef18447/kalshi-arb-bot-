@@ -202,6 +202,39 @@ CREATE TABLE IF NOT EXISTS live_orders (
     cancelled_at REAL,
     expires_at REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS maker_paper_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp REAL NOT NULL,
+    event_ticker TEXT NOT NULL,
+    series_ticker TEXT NOT NULL,
+    event_title TEXT NOT NULL,
+    bucket_ticker TEXT NOT NULL,
+    bucket_label TEXT NOT NULL,
+    category TEXT NOT NULL,
+    signal_type TEXT NOT NULL,
+    filter_version TEXT NOT NULL DEFAULT 'v2',
+    -- Pricing at signal time
+    limit_price INTEGER NOT NULL,
+    fair_value_est INTEGER NOT NULL,
+    yes_bid_at_signal INTEGER NOT NULL,
+    yes_ask_at_signal INTEGER NOT NULL,
+    spread_at_signal INTEGER NOT NULL,
+    overpricing_gap INTEGER NOT NULL,
+    total_event_excess INTEGER NOT NULL,
+    bid_depth_at_signal INTEGER NOT NULL DEFAULT 0,
+    -- Fill tracking
+    status TEXT NOT NULL DEFAULT 'posted',
+    filled_at REAL,
+    fill_price INTEGER,
+    fill_latency_seconds REAL,
+    checks_count INTEGER NOT NULL DEFAULT 0,
+    best_bid_seen INTEGER,
+    -- Resolution
+    resolved_at REAL,
+    resolved_price INTEGER,
+    pnl_cents INTEGER
+);
 """
 
 # Indexes — created after migrations so columns exist
@@ -245,6 +278,10 @@ CREATE INDEX IF NOT EXISTS idx_mispricing_category ON mispricing_signals(categor
 CREATE INDEX IF NOT EXISTS idx_live_orders_ts ON live_orders(timestamp);
 CREATE INDEX IF NOT EXISTS idx_live_orders_status ON live_orders(status);
 CREATE INDEX IF NOT EXISTS idx_live_orders_bucket ON live_orders(bucket_ticker);
+CREATE INDEX IF NOT EXISTS idx_maker_paper_ts ON maker_paper_orders(timestamp);
+CREATE INDEX IF NOT EXISTS idx_maker_paper_status ON maker_paper_orders(status);
+CREATE INDEX IF NOT EXISTS idx_maker_paper_bucket ON maker_paper_orders(bucket_ticker);
+CREATE INDEX IF NOT EXISTS idx_maker_paper_signal ON maker_paper_orders(signal_type);
 """
 
 

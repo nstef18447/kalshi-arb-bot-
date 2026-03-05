@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import config
+import db
 import db_logger
 import kalshi_api
 
@@ -65,6 +66,13 @@ BTC_GAP_EXCLUSION_MIN = 10
 BTC_GAP_EXCLUSION_MAX = 29
 
 FILTER_VERSION = "v2"
+
+# ── Maker order strategy ──────────────────────────────────────────────
+# Instead of taker orders at bid, post limit SELL YES at a profitable price.
+# This avoids the bid<=FV problem (89.7% of signals rejected).
+MAKER_OFFSET = 3              # Post limit at fair_value + this many cents
+MAKER_ORDER_TTL = 7200        # Expire unfilled maker orders after 2 hours
+TAKER_GAP_THRESHOLD = 31      # Gaps >= this use taker at bid (edge absorbs spread)
 
 # ── Fair value models ────────────────────────────────────────────────────
 # Static base rates derived from historical data. These are starting points —
@@ -541,6 +549,9 @@ class MispricingScanner:
             "overpriced_events": 0,
             "paper_trades": 0,
             "resolved_trades": 0,
+            "maker_orders_posted": 0,
+            "maker_orders_filled": 0,
+            "maker_orders_expired": 0,
         }
         # Paper trade dedup: 24h cooldown, checked via DB
         self._paper_trade_cooldown = 86400  # 24 hours
@@ -665,6 +676,129 @@ class MispricingScanner:
             entry_price, result.upper(), pnl, adj_str,
         )
 
+    def _check_maker_fills(self):
+        """Check open maker paper orders for simulated fills.
+
+        A maker SELL YES order fills if the market's yes_bid >= our limit price
+        (someone is willing to buy YES at our price or higher).
+        """
+        open_orders = db_logger.get_open_maker_paper_orders()
+        if not open_orders:
+            return
+
+        now = time.time()
+        for order in open_orders:
+            # Expire stale orders
+            age = now - order["timestamp"]
+            if age > MAKER_ORDER_TTL:
+                db_logger.expire_maker_paper_order(order["id"])
+                self.stats["maker_orders_expired"] += 1
+                logger.debug(
+                    "MAKER EXPIRED: %s after %.0fs",
+                    order["bucket_ticker"], age,
+                )
+                continue
+
+            # Check current orderbook
+            try:
+                book = kalshi_api.get_orderbook(order["bucket_ticker"], depth=1)
+            except Exception:
+                continue
+
+            yes_bids = book.get("yes", [])
+            current_bid = yes_bids[0][0] if yes_bids else 0
+
+            # Update check count and best bid seen
+            db_logger.update_maker_paper_check(order["id"], current_bid)
+
+            # Fill condition: someone bidding at or above our limit price
+            if current_bid >= order["limit_price"]:
+                fill_latency = now - order["timestamp"]
+                db_logger.fill_maker_paper_order(
+                    order["id"], order["limit_price"], fill_latency,
+                )
+                self.stats["maker_orders_filled"] += 1
+                logger.warning(
+                    "MAKER FILLED: %s | limit=%dc bid=%dc | latency=%.0fs",
+                    order["bucket_ticker"], order["limit_price"],
+                    current_bid, fill_latency,
+                )
+
+    def _check_maker_resolutions(self):
+        """Resolve filled maker orders and expire posted ones for settled markets."""
+        conn = db.get_connection(readonly=True)
+        try:
+            rows = conn.execute(
+                "SELECT id, event_ticker, bucket_ticker, fill_price, status "
+                "FROM maker_paper_orders "
+                "WHERE (status = 'filled' AND resolved_at IS NULL) OR status = 'posted'"
+            ).fetchall()
+            all_orders = [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+        if not all_orders:
+            return
+
+        filled_orders = [o for o in all_orders if o["status"] == "filled"]
+        posted_orders = [o for o in all_orders if o["status"] == "posted"]
+
+        # Group ALL orders by event (both filled and posted)
+        by_event: dict[str, list[dict]] = {}
+        for o in filled_orders + posted_orders:
+            by_event.setdefault(o["event_ticker"], []).append(o)
+
+        for event_ticker, orders in by_event.items():
+            try:
+                settled = kalshi_api.get_markets_for_event(event_ticker, status="settled")
+            except Exception:
+                continue
+
+            if not settled:
+                # Check individual markets for filled orders only
+                for order in orders:
+                    if order["status"] != "filled":
+                        continue
+                    try:
+                        market = kalshi_api.get_market(order["bucket_ticker"])
+                        if market.get("status") in ("settled", "finalized"):
+                            result = market.get("result", "")
+                            self._resolve_maker_order(order, result)
+                    except Exception:
+                        pass
+                continue
+
+            settled_tickers = {m.get("ticker", "") for m in settled}
+            result_map = {m.get("ticker", ""): m.get("result", "") for m in settled}
+
+            for order in orders:
+                ticker = order["bucket_ticker"]
+                if ticker not in settled_tickers:
+                    continue
+                if order["status"] == "filled":
+                    result = result_map.get(ticker)
+                    if result:
+                        self._resolve_maker_order(order, result)
+                elif order["status"] == "posted":
+                    # Market settled without our order filling
+                    db_logger.expire_maker_paper_order(order["id"])
+                    self.stats["maker_orders_expired"] += 1
+
+    def _resolve_maker_order(self, order: dict, result: str):
+        """Resolve a single filled maker order."""
+        fill_price = order["fill_price"]
+        # We SOLD YES at fill_price
+        if result == "yes":
+            pnl = -(100 - fill_price)
+        else:
+            pnl = fill_price
+
+        db_logger.resolve_maker_paper_order(order["id"], 100 if result == "yes" else 0, pnl)
+        logger.info(
+            "MAKER RESOLVED: %s | sold@%dc -> %s | P&L=%+dc",
+            order["bucket_ticker"], fill_price, result.upper(), pnl,
+        )
+
     def _execute_live_order(self, signal):
         """Place a SELL YES limit order at yes_bid price."""
         if signal.yes_bid <= 0:
@@ -717,8 +851,15 @@ class MispricingScanner:
             self.last_resolution_check = now
             try:
                 self._check_resolutions()
+                self._check_maker_resolutions()
             except Exception:
                 logger.exception("Error checking paper trade resolutions")
+
+        # Check maker order fills every cycle
+        try:
+            self._check_maker_fills()
+        except Exception:
+            logger.debug("Error checking maker fills")
 
         # Refresh political series discovery every POLITICAL_REFRESH_INTERVAL
         if now - self._last_political_refresh >= POLITICAL_REFRESH_INTERVAL:
@@ -792,12 +933,7 @@ class MispricingScanner:
                             bid_depth=sig.bid_depth,
                         )
 
-                        # Dedup paper trade: one per bucket_ticker, with 24h cooldown
-                        if db_logger.has_open_or_recent_paper_trade(
-                            sig.bucket_ticker, self._paper_trade_cooldown
-                        ):
-                            continue
-
+                        # ── Shared filters (apply to both maker and taker) ──
                         # Liquidity filters: skip illiquid buckets
                         if sig.bid_depth < MIN_BID_DEPTH:
                             logger.debug(
@@ -812,14 +948,6 @@ class MispricingScanner:
                             )
                             continue
 
-                        # Bid-price guard: only trade if the bid we'd sell at exceeds fair value
-                        if sig.yes_bid <= sig.fair_value_est:
-                            logger.debug(
-                                "SKIP (bid <= fair value): %s | bid=%dc <= fv=%dc",
-                                sig.bucket_ticker, sig.yes_bid, sig.fair_value_est,
-                            )
-                            continue
-
                         # BTC gap exclusion zone: 10-29c gaps are net negative
                         if sig.series_ticker == "KXBTC" and BTC_GAP_EXCLUSION_MIN <= sig.overpricing_gap <= BTC_GAP_EXCLUSION_MAX:
                             logger.debug(
@@ -829,39 +957,85 @@ class MispricingScanner:
                             )
                             continue
 
-                        self.stats["paper_trades"] += 1
+                        # ── Maker orders: post limit SELL YES ──
+                        # No bid guard needed — we set our own price.
+                        # Limit = max(fv + MAKER_OFFSET, midpoint of bid/ask)
+                        if not db_logger.has_open_maker_paper_order(sig.bucket_ticker):
+                            midpoint = (sig.yes_bid + sig.yes_ask + 1) // 2  # round up
+                            limit_price = max(
+                                sig.fair_value_est + MAKER_OFFSET,
+                                midpoint,
+                            )
+                            # Sanity: limit must be between bid and ask
+                            limit_price = max(sig.yes_bid + 1, min(limit_price, sig.yes_ask))
 
-                        logger.warning(
-                            "PAPER TRADE: %s | %s | ask=%dc bid=%dc spread=%dc fair=%dc gap=+%dc | bid_depth=%d",
-                            sig.event_title[:50], sig.bucket_label[:40],
-                            sig.yes_ask, sig.yes_bid, sig.spread,
-                            sig.fair_value_est, sig.overpricing_gap,
-                            sig.bid_depth,
-                        )
+                            self.stats["maker_orders_posted"] += 1
+                            logger.warning(
+                                "MAKER POST: %s | %s | limit=%dc (fv=%dc+%d mid=%dc) spread=%dc gap=+%dc | depth=%d",
+                                sig.event_title[:50], sig.bucket_label[:40],
+                                limit_price, sig.fair_value_est, MAKER_OFFSET,
+                                midpoint, sig.spread, sig.overpricing_gap,
+                                sig.bid_depth,
+                            )
 
-                        db_logger.log_paper_trade(
-                            event_ticker=sig.event_ticker,
-                            series_ticker=sig.series_ticker,
-                            event_title=sig.event_title,
-                            bucket_ticker=sig.bucket_ticker,
-                            bucket_label=sig.bucket_label,
-                            category=sig.category,
-                            signal_type=signal_type,
-                            entry_price=sig.current_price,
-                            fair_value_est=sig.fair_value_est,
-                            overpricing_gap=sig.overpricing_gap,
-                            total_event_excess=sig.total_event_excess,
-                            yes_depth=sig.yes_depth,
-                            yes_bid=sig.yes_bid,
-                            yes_ask=sig.yes_ask,
-                            spread=sig.spread,
-                            bid_depth=sig.bid_depth,
-                            filter_version=FILTER_VERSION,
-                        )
+                            db_logger.log_maker_paper_order(
+                                event_ticker=sig.event_ticker,
+                                series_ticker=sig.series_ticker,
+                                event_title=sig.event_title,
+                                bucket_ticker=sig.bucket_ticker,
+                                bucket_label=sig.bucket_label,
+                                category=sig.category,
+                                signal_type=signal_type,
+                                limit_price=limit_price,
+                                fair_value_est=sig.fair_value_est,
+                                yes_bid_at_signal=sig.yes_bid,
+                                yes_ask_at_signal=sig.yes_ask,
+                                spread_at_signal=sig.spread,
+                                overpricing_gap=sig.overpricing_gap,
+                                total_event_excess=sig.total_event_excess,
+                                bid_depth_at_signal=sig.bid_depth,
+                                filter_version=FILTER_VERSION,
+                            )
 
-                        # Live execution: place limit sell at yes_bid
-                        if config.LIVE_EXECUTION and not config.READ_ONLY:
-                            self._execute_live_order(sig)
+                        # ── Taker paper trades: only for large gaps (31c+) ──
+                        # These have enough edge to absorb the spread.
+                        if sig.overpricing_gap >= TAKER_GAP_THRESHOLD and sig.yes_bid > sig.fair_value_est:
+                            # Dedup taker trades: 24h cooldown per bucket
+                            if not db_logger.has_open_or_recent_paper_trade(
+                                sig.bucket_ticker, self._paper_trade_cooldown
+                            ):
+                                self.stats["paper_trades"] += 1
+                                logger.warning(
+                                    "TAKER TRADE: %s | %s | ask=%dc bid=%dc spread=%dc fair=%dc gap=+%dc | bid_depth=%d",
+                                    sig.event_title[:50], sig.bucket_label[:40],
+                                    sig.yes_ask, sig.yes_bid, sig.spread,
+                                    sig.fair_value_est, sig.overpricing_gap,
+                                    sig.bid_depth,
+                                )
+
+                                db_logger.log_paper_trade(
+                                    event_ticker=sig.event_ticker,
+                                    series_ticker=sig.series_ticker,
+                                    event_title=sig.event_title,
+                                    bucket_ticker=sig.bucket_ticker,
+                                    bucket_label=sig.bucket_label,
+                                    category=sig.category,
+                                    signal_type=signal_type,
+                                    entry_price=sig.current_price,
+                                    fair_value_est=sig.fair_value_est,
+                                    overpricing_gap=sig.overpricing_gap,
+                                    total_event_excess=sig.total_event_excess,
+                                    yes_depth=sig.yes_depth,
+                                    yes_bid=sig.yes_bid,
+                                    yes_ask=sig.yes_ask,
+                                    spread=sig.spread,
+                                    bid_depth=sig.bid_depth,
+                                    filter_version=FILTER_VERSION,
+                                )
+
+                                # Live execution: place limit sell at yes_bid
+                                if config.LIVE_EXECUTION and not config.READ_ONLY:
+                                    self._execute_live_order(sig)
 
                     # Log near misses (with separate cooldown)
                     for nm in near_misses:
@@ -873,10 +1047,13 @@ class MispricingScanner:
 
         if self.scan_count % 12 == 0:  # Every ~60s at 5s interval
             logger.info(
-                "Scan #%d — events=%d signals=%d paper=%d resolved=%d",
+                "Scan #%d — events=%d signals=%d paper=%d resolved=%d | maker: posted=%d filled=%d expired=%d",
                 self.scan_count, self.stats["events_checked"],
                 self.stats["signals_found"], self.stats["paper_trades"],
                 self.stats["resolved_trades"],
+                self.stats["maker_orders_posted"],
+                self.stats["maker_orders_filled"],
+                self.stats["maker_orders_expired"],
             )
 
         # Clean up old near-miss dedup entries

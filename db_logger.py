@@ -475,6 +475,121 @@ def get_open_live_orders():
         conn.close()
 
 
+def log_maker_paper_order(event_ticker, series_ticker, event_title,
+                          bucket_ticker, bucket_label, category, signal_type,
+                          limit_price, fair_value_est,
+                          yes_bid_at_signal, yes_ask_at_signal, spread_at_signal,
+                          overpricing_gap, total_event_excess,
+                          bid_depth_at_signal=0, filter_version="v2"):
+    """Log a hypothetical maker limit SELL YES order."""
+    conn = db.get_connection()
+    try:
+        cursor = conn.execute(
+            "INSERT INTO maker_paper_orders "
+            "(timestamp, event_ticker, series_ticker, event_title, "
+            "bucket_ticker, bucket_label, category, signal_type, filter_version, "
+            "limit_price, fair_value_est, "
+            "yes_bid_at_signal, yes_ask_at_signal, spread_at_signal, "
+            "overpricing_gap, total_event_excess, bid_depth_at_signal) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (time.time(), event_ticker, series_ticker, event_title,
+             bucket_ticker, bucket_label, category, signal_type, filter_version,
+             limit_price, fair_value_est,
+             yes_bid_at_signal, yes_ask_at_signal, spread_at_signal,
+             overpricing_gap, total_event_excess, bid_depth_at_signal),
+        )
+        conn.commit()
+        return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def get_open_maker_paper_orders():
+    """Return all posted (unfilled) maker paper orders."""
+    conn = db.get_connection(readonly=True)
+    try:
+        rows = conn.execute(
+            "SELECT id, event_ticker, series_ticker, bucket_ticker, "
+            "limit_price, fair_value_est, timestamp, checks_count, best_bid_seen "
+            "FROM maker_paper_orders WHERE status = 'posted'"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def fill_maker_paper_order(order_id, fill_price, fill_latency_seconds):
+    """Mark a maker paper order as filled."""
+    conn = db.get_connection()
+    try:
+        conn.execute(
+            "UPDATE maker_paper_orders SET status = 'filled', "
+            "filled_at = ?, fill_price = ?, fill_latency_seconds = ? "
+            "WHERE id = ?",
+            (time.time(), fill_price, fill_latency_seconds, order_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def expire_maker_paper_order(order_id):
+    """Mark a maker paper order as expired (market settled without fill)."""
+    conn = db.get_connection()
+    try:
+        conn.execute(
+            "UPDATE maker_paper_orders SET status = 'expired' WHERE id = ?",
+            (order_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def update_maker_paper_check(order_id, best_bid_seen):
+    """Increment check count and update best bid seen."""
+    conn = db.get_connection()
+    try:
+        conn.execute(
+            "UPDATE maker_paper_orders SET checks_count = checks_count + 1, "
+            "best_bid_seen = MAX(COALESCE(best_bid_seen, 0), ?) "
+            "WHERE id = ?",
+            (best_bid_seen, order_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def resolve_maker_paper_order(order_id, resolved_price, pnl_cents):
+    """Resolve a filled maker paper order with the market outcome."""
+    conn = db.get_connection()
+    try:
+        conn.execute(
+            "UPDATE maker_paper_orders SET resolved_at = ?, "
+            "resolved_price = ?, pnl_cents = ? "
+            "WHERE id = ?",
+            (time.time(), resolved_price, pnl_cents, order_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def has_open_maker_paper_order(bucket_ticker):
+    """Check if there's already an open maker order for this bucket."""
+    conn = db.get_connection(readonly=True)
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM maker_paper_orders "
+            "WHERE bucket_ticker = ? AND status = 'posted' LIMIT 1",
+            (bucket_ticker,),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
 def log_trade(expiry_window, opp_type, strike_low, strike_high,
               leg1_side, leg1_price, leg1_fill_status,
               leg2_side=None, leg2_price=None, leg2_fill_status=None,
