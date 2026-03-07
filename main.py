@@ -157,7 +157,31 @@ def main():
             print("  Check your API credentials and try again.")
             sys.exit(1)
 
-    if config.MODE == "mispricing_scanner":
+    if config.MODE == "whale_executor":
+        from whale_executor import WhaleExecutor, BET_SIZE_DOLLARS, POLL_INTERVAL, ALLOWED_PREFIXES, ALLOWED_TIERS, ALLOWED_BUCKETS, MIN_GAP
+        print(f"\n{'='*50}")
+        print(f"  Kalshi Whale Signal Executor — {os.getenv('KALSHI_ENV', 'demo').upper()}")
+        print(f"{'='*50}")
+        print(f"  Bet size:        ${BET_SIZE_DOLLARS:.2f}")
+        print(f"  Poll interval:   {POLL_INTERVAL}s")
+        print(f"  Ticker prefixes: {ALLOWED_PREFIXES}")
+        print(f"  Wallet tiers:    {ALLOWED_TIERS}")
+        print(f"  Price buckets:   {ALLOWED_BUCKETS}")
+        print(f"  Min gap:         {MIN_GAP:.2f}")
+        if config.READ_ONLY:
+            print(f"\n  MODE: PAPER TRADING (orders logged, not placed)")
+        else:
+            print(f"\n  MODE: LIVE TRADING")
+        print(f"{'='*50}\n")
+        executor = WhaleExecutor()
+        try:
+            executor.start()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            executor.stop()
+            print("\nWhale executor shut down cleanly.")
+    elif config.MODE == "mispricing_scanner":
         from mispricing_scanner import MispricingScanner
         scanner = MispricingScanner()
         try:

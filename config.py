@@ -3,7 +3,7 @@ import os
 # --- Mode ---
 MODE = os.getenv("MODE", "read_only").lower()
 LIVE_EXECUTION = os.getenv("LIVE_EXECUTION", "").lower() in ("true", "1")
-READ_ONLY = (MODE not in ("arb", "market_maker", "binary_arb") and not LIVE_EXECUTION) or os.getenv("READ_ONLY", "").lower() in ("true", "1")
+READ_ONLY = (MODE not in ("arb", "market_maker", "binary_arb", "whale_executor") and not LIVE_EXECUTION) or os.getenv("READ_ONLY", "").lower() in ("true", "1")
 # mispricing_scanner trades when LIVE_EXECUTION=true and READ_ONLY is not forced
 
 ARB_THRESHOLD = 95          # Max combined price in cents to trigger arb
