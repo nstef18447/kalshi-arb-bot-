@@ -17,11 +17,18 @@ import sqlite3
 import time
 from datetime import datetime, timezone
 
+import httpx
+
 import config
 import db
 import kalshi_api
 
 logger = logging.getLogger("whale-executor")
+
+DISCORD_WEBHOOK_URL = os.getenv(
+    "DISCORD_WEBHOOK_URL",
+    "https://discord.com/api/webhooks/1479286527912710326/yFR2dS1Z51VgKLnP2P2Y-NTadPUWhI9ftl7d2UtG5mv1fF7q92s9HEOF2iTp_giPJ62O",
+)
 
 # --- Configuration ---
 POLY_DB_PATH = os.getenv(
@@ -241,6 +248,7 @@ def _place_order(alert: dict) -> dict | None:
             conn.commit()
         finally:
             conn.close()
+        _send_trade_discord(alert, kalshi_side, best_ask_cents, count, is_paper=True)
         return {"db_id": order_db_id, "status": "paper"}
 
     # Place the actual order
@@ -265,6 +273,7 @@ def _place_order(alert: dict) -> dict | None:
             conn.close()
 
         logger.info("Order placed: id=%s status=%s", order_id, status)
+        _send_trade_discord(alert, kalshi_side, best_ask_cents, count, is_paper=False)
         return {"db_id": order_db_id, "order_id": order_id, "status": status}
 
     except Exception as e:
@@ -279,6 +288,54 @@ def _place_order(alert: dict) -> dict | None:
         finally:
             conn.close()
         return None
+
+
+def _send_trade_discord(alert: dict, kalshi_side: str, price_cents: int, count: int, is_paper: bool):
+    """Send a Discord notification about a whale-following trade."""
+    if not DISCORD_WEBHOOK_URL:
+        return
+
+    mode = "PAPER" if is_paper else "LIVE"
+    cost = count * price_cents / 100
+    potential_profit = count * (100 - price_cents) / 100
+
+    color = 0x3498db if is_paper else 0x2ecc71  # blue for paper, green for live
+
+    fields = [
+        {"name": "Kalshi Ticker", "value": f"`{alert['kalshi_ticker']}`", "inline": True},
+        {"name": "Side", "value": f"BUY {kalshi_side.upper()}", "inline": True},
+        {"name": "Price", "value": f"{price_cents}c ({count} contracts)", "inline": True},
+        {"name": "Cost", "value": f"${cost:.2f}", "inline": True},
+        {"name": "Potential Win", "value": f"${potential_profit:.2f}", "inline": True},
+        {"name": "Gap", "value": f"{alert.get('price_gap', 0):+.2f}", "inline": True},
+    ]
+
+    whale_info = f"Whale {alert['side']} {alert['outcome']} @ {alert['poly_price']:.2f}"
+    tier = alert.get("wallet_tier", "")
+    if tier:
+        tier_icons = {"ELITE": "\U0001f3c6", "STRONG": "\U0001f4aa", "AVERAGE": "\U0001f4ca"}
+        whale_info += f" | {tier_icons.get(tier, '')} {tier}"
+
+    fields.append({"name": "Whale Signal", "value": whale_info, "inline": False})
+
+    payload = {
+        "embeds": [{
+            "title": f"\U0001f4b0 {mode} TRADE — ${cost:.2f}",
+            "description": (alert.get("market_title") or "")[:200],
+            "color": color,
+            "fields": fields,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "footer": {"text": f"Kalshi Whale Executor ({mode})"},
+        }],
+    }
+
+    try:
+        with httpx.Client(timeout=10) as client:
+            resp = client.post(DISCORD_WEBHOOK_URL, json=payload)
+            if resp.status_code not in (200, 204):
+                logger.warning("Discord webhook returned %d", resp.status_code)
+    except Exception:
+        logger.warning("Failed to send Discord trade notification")
 
 
 def _check_open_orders():
