@@ -62,12 +62,38 @@ SPORTS_TICKER_TOKENS = [
     "STANLEY", "SUPERBOWL", "CHAMPION", "MASTERS", "CRICKET", "RUGBY",
 ]
 
+# Money-line filter: only watch series that represent "who wins the game/match/fight"
+# Not props, not player over/unders, not totals, not spreads.
+MONEY_LINE_INCLUDES = ("GAME", "MATCH", "FIGHT", "WINNER", "BOUT")
+MONEY_LINE_EXCLUDES = (
+    "TOTAL", "SPREAD", "PLAYER", "PLYR", "PROP", "OTM", "OTU", "OVER", "UNDER",
+    "PARLAY", "FIRST", "LAST", "SCORE", "INNING", "QUARTER", "HALF", "MARGIN",
+    "RUNS", "POINTS", "GOAL", "ASSIST", "REBOUND", "STRIKEOUT", "HOMER", "HR",
+    "SIX", "BOUNDARY", "WICKET", "BIRDIE", "EAGLE", "ACE", "DOUBLE",
+)
+
 
 def is_sports_ticker(ticker: str) -> bool:
     if not ticker:
         return False
     upper = ticker.upper()
     return any(tok in upper for tok in SPORTS_TICKER_TOKENS)
+
+
+def is_money_line_series(series_ticker: str) -> bool:
+    """Return True if a series_ticker looks like a 'who wins' market.
+
+    Strategy: reject anything containing prop/over-under/spread tokens, then
+    accept if it contains a game/match/fight token. Default reject — for an
+    ambiguous case (championship futures, season awards) we'd rather miss data
+    than record props that aren't real money-line favorites.
+    """
+    if not series_ticker:
+        return False
+    upper = series_ticker.upper()
+    if any(tok in upper for tok in MONEY_LINE_EXCLUDES):
+        return False
+    return any(tok in upper for tok in MONEY_LINE_INCLUDES)
 
 
 def _to_float(v) -> float:
@@ -176,6 +202,7 @@ def discover_sports_series() -> list[str]:
     """
     series: dict[str, str] = {}
     n_events = 0
+    n_sports_series_seen = 0
     for ev in _iter_paginated_with_backoff(
         "/trade-api/v2/events",
         {"status": "open", "limit": 200},
@@ -187,8 +214,12 @@ def discover_sports_series() -> list[str]:
         if not st:
             continue
         if cat == "sports":
-            series.setdefault(st, ev.get("title", ""))
-    logger.info("Found %d sports series across %d open events", len(series), n_events)
+            n_sports_series_seen += 1
+            if is_money_line_series(st):
+                series.setdefault(st, ev.get("title", ""))
+    logger.info("Found %d money-line sports series (out of %d sports events seen) "
+                "across %d total open events",
+                len(series), n_sports_series_seen, n_events)
     return sorted(series.keys())
 
 
