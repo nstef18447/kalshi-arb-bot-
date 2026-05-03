@@ -731,7 +731,8 @@ class MispricingScanner:
             rows = conn.execute(
                 "SELECT id, event_ticker, bucket_ticker, fill_price, status "
                 "FROM maker_paper_orders "
-                "WHERE (status = 'filled' AND resolved_at IS NULL) OR status = 'posted'"
+                "WHERE ((status = 'filled' AND resolved_at IS NULL) OR status = 'posted') "
+                "AND signal_type NOT LIKE 'sports_favorite_buy%'"
             ).fetchall()
             all_orders = [dict(r) for r in rows]
         finally:
