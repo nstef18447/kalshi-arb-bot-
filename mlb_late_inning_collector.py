@@ -49,6 +49,7 @@ RESOLUTION_INTERVAL_SECONDS = 300   # check resolutions every 5 min
 SIGNAL_TYPE = "mlb_late_inning_favorite"
 KALSHI_SERIES = "KXMLBGAME"
 MLB_API = "https://statsapi.mlb.com/api/v1"
+MLB_API_LIVE = "https://statsapi.mlb.com/api/v1.1"  # live feed uses v1.1
 
 # Ticker format: KXMLBGAME-YYMMMDDhhmm{AWAY}{HOME}-{TEAM}
 # e.g.  KXMLBGAME-26MAY061610ATLSEA-SEA
@@ -134,7 +135,7 @@ def fetch_mlb_schedule(date_str: str) -> list[dict]:
 
 def fetch_mlb_game_live(game_pk: int) -> dict:
     """Fetch live feed for a game — returns linescore + status snapshot."""
-    url = f"{MLB_API}/game/{game_pk}/feed/live"
+    url = f"{MLB_API_LIVE}/game/{game_pk}/feed/live"
     r = requests.get(url, timeout=10)
     r.raise_for_status()
     return r.json()
