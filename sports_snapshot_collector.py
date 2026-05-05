@@ -1,9 +1,12 @@
-"""Unified sports market-snapshot research collector (MLB / NHL / NBA / NFL).
+"""Unified sports market-snapshot research collector.
 
-For every open Kalshi market in the four major-sport money-line series, this
-script snapshots both sides' yes_ask / yes_bid / depth alongside the live
-game state (period/inning/quarter, clock, score) every N minutes. Once a
-game settles, records the winner and final scores into all snapshot rows.
+Major US sports (MLB / NHL / NBA / NFL), college (NCAA football, NCAA
+baseball), WNBA, top-five soccer leagues (EPL / MLS / UCL / La Liga /
+Bundesliga), and individual-athlete sports (ATP, WTA, UFC, Boxing). For
+every open Kalshi money-line market this script snapshots both sides'
+yes_ask / yes_bid / depth alongside the live game state (period/inning/
+quarter, clock, score) every N minutes. Once a game settles, records the
+winner and final scores into all snapshot rows.
 
 Strategy this dataset is meant to validate: deep-favorite buys (85-95c) on
 heavy favorites *after* a sport-specific high-confidence threshold (MLB
@@ -13,10 +16,18 @@ round). Without intra-game price + state history we can't backtest it.
 Game-state source: ESPN's free public scoreboard API
   https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard?dates=YYYYMMDD
 
-Match key: (sport, date) selects ESPN candidates; team displayName / name
-substring against the parsed Kalshi event title picks the specific game.
-Unmatched events still record price snapshots; the unresolved tickers go
-to sports_match_failures so we can add aliases over time.
+For team sports the ESPN event maps 1:1 to a Kalshi event. For athlete
+sports (tennis, UFC) one ESPN event holds many matches/fights inside its
+groupings/competitions, so we flatten those into synthetic per-match
+events that the rest of the matcher can treat as if they were separate
+team events. Boxing has no public ESPN endpoint, so its rows record price
+snapshots only (no game state); that's still useful price-history data.
+
+Match key: (sport, date) selects ESPN candidates; for team sports a team
+displayName / name substring against the parsed Kalshi title picks the
+game. For athlete sports a last-name substring against athlete displayName
+is used. Unmatched events still record price snapshots; unresolved
+tickers go to sports_match_failures so we can add aliases over time.
 
 Schema is its own table (sports_market_snapshots) so this stays isolated
 from the production paper-trade tables.
@@ -28,6 +39,7 @@ import logging
 import re
 import sys
 import time
+import unicodedata
 from datetime import datetime, date, timedelta
 from urllib.parse import urlencode
 
@@ -50,18 +62,71 @@ RESOLUTION_INTERVAL_SECONDS = 600      # check resolutions every 10 min
 
 # Kalshi money-line series we care about. Hardcoded — these are stable, and
 # enumerating them avoids a 2,000+-event /events scan per discovery cycle.
+#
+# Notes on coverage:
+#   - "KXNCAABBGAME" is Kalshi's College **Baseball** (despite the BB suffix).
+#     There is no game-level Kalshi series for NCAA Men's or Women's
+#     basketball at this time — only conference/championship futures. If
+#     Kalshi adds them (e.g. KXNCAAMBBGAME) we just append here.
+#   - Boxing (KXBOXING) has no matching ESPN endpoint; we still record
+#     price snapshots so the dataset captures the dataset's pre-fight
+#     market depth, just without ESPN game state.
 KALSHI_SERIES_TO_SPORT = {
+    # Wave 0 — original four
     "KXMLBGAME": "MLB",
     "KXNHLGAME": "NHL",
     "KXNBAGAME": "NBA",
     "KXNFLGAME": "NFL",
+    # Wave A — additional team sports
+    "KXNCAAFGAME":      "NCAAF",
+    "KXNCAABBGAME":     "NCAABSB",   # College Baseball (Kalshi's BB = baseball)
+    "KXWNBAGAME":       "WNBA",
+    "KXEPLGAME":        "EPL",
+    "KXMLSGAME":        "MLS",
+    "KXUCLGAME":        "UCL",
+    "KXLALIGAGAME":     "LALIGA",
+    "KXBUNDESLIGAGAME": "BUNDESLIGA",
+    # Wave B — individual-athlete sports
+    "KXATPMATCH": "ATP",
+    "KXWTAMATCH": "WTA",
+    "KXUFCFIGHT": "UFC",
+    "KXBOXING":   "BOXING",
 }
 
-ESPN_SCOREBOARD = {
-    "MLB": "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard",
-    "NHL": "https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard",
-    "NBA": "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
-    "NFL": "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard",
+# ESPN scoreboard endpoints. None means "no game-state source available";
+# the collector still records Kalshi prices but leaves ESPN fields null.
+ESPN_SCOREBOARD: dict[str, str | None] = {
+    "MLB":        "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard",
+    "NHL":        "https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard",
+    "NBA":        "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
+    "NFL":        "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard",
+    "NCAAF":      "https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard",
+    "NCAABSB":    "https://site.api.espn.com/apis/site/v2/sports/baseball/college-baseball/scoreboard",
+    "WNBA":       "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/scoreboard",
+    "EPL":        "https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/scoreboard",
+    "MLS":        "https://site.api.espn.com/apis/site/v2/sports/soccer/usa.1/scoreboard",
+    "UCL":        "https://site.api.espn.com/apis/site/v2/sports/soccer/uefa.champions/scoreboard",
+    "LALIGA":     "https://site.api.espn.com/apis/site/v2/sports/soccer/esp.1/scoreboard",
+    "BUNDESLIGA": "https://site.api.espn.com/apis/site/v2/sports/soccer/ger.1/scoreboard",
+    "ATP":        "https://site.api.espn.com/apis/site/v2/sports/tennis/atp/scoreboard",
+    "WTA":        "https://site.api.espn.com/apis/site/v2/sports/tennis/wta/scoreboard",
+    "UFC":        "https://site.api.espn.com/apis/site/v2/sports/mma/ufc/scoreboard",
+    # Boxing: ESPN's site API does not expose a public boxing scoreboard
+    # (boxing/top-rank etc all 400). We register Kalshi side only.
+    "BOXING":     None,
+}
+
+# Sports whose ESPN events expose athletes (not teams) in `competitors[]`.
+# These are flattened from "tournament/card events that contain many
+# matches" into synthetic per-match events before matching.
+ATHLETE_SPORTS = {"ATP", "WTA", "UFC", "BOXING"}
+
+# For tennis tournaments the ESPN event has multiple groupings (mens-singles,
+# womens-singles, mens-doubles, womens-doubles); we only track the Kalshi-
+# relevant ones.
+TENNIS_GROUPING_SLUG = {
+    "ATP": "mens-singles",
+    "WTA": "womens-singles",
 }
 
 MONTH_MAP = {
@@ -115,11 +180,92 @@ TEAM_ALIASES: dict[str, dict[str, list[str]]] = {
         "tampa bay": ["buccaneers", "tb"],
         "kansas city": ["chiefs", "kc"],
     },
+    "NCAAF": {
+        # Kalshi uses parenthetical disambiguation; ESPN uses unique mascot names.
+        "miami (fl)": ["miami hurricanes", "hurricanes"],
+        "miami (oh)": ["miami (oh)", "redhawks"],
+    },
+    "WNBA": {
+        # Kalshi uses just the city; ESPN team displayName always starts with
+        # the city, so the default substring match handles every team.
+    },
+    "EPL": {
+        # Most match via substring; "newcastle" -> "Newcastle United" works,
+        # "wolverhampton" -> "Wolverhampton Wanderers" works, etc.
+        "nottingham": ["nottingham forest"],
+        "tottenham": ["tottenham hotspur"],
+        "west ham": ["west ham united"],
+        "brighton": ["brighton & hove albion"],
+        "bournemouth": ["afc bournemouth"],
+    },
+    "MLS": {
+        # Kalshi uses single-letter suffixes when multiple MLS teams are in
+        # the same metro: "Los Angeles F" = LAFC, "Los Angeles G" = LA Galaxy,
+        # "New York RB" = Red Bull NY (NYCFC stays as "New York City").
+        "los angeles f": ["lafc", "los angeles fc"],
+        "los angeles g": ["la galaxy", "galaxy"],
+        "new york rb": ["red bull new york", "new york red bulls"],
+        "saint louis": ["st. louis city", "st louis city"],
+        "salt lake": ["real salt lake"],
+        "miami": ["inter miami"],
+        "kansas city": ["sporting kansas city", "sporting kc"],
+        "dc united": ["d.c. united", "dc united"],
+        "new england": ["new england revolution", "revolution"],
+        "chicago fire": ["chicago fire fc"],
+        "san diego fc": ["san diego fc"],
+        "montreal": ["cf montréal", "cf montreal", "montréal"],
+    },
+    "UCL": {
+        # UCL has 38 different clubs; substring matches on the most common
+        # short forms suffice for finals/semis we'll see.
+        "psg": ["paris saint-germain", "paris"],
+        "atletico": ["atlético madrid", "atletico madrid"],
+        "bayern munich": ["bayern münchen", "bayern"],
+        "inter": ["inter milan", "internazionale"],
+    },
+    "LALIGA": {
+        "bilbao": ["athletic club", "athletic bilbao"],
+        "atletico": ["atlético madrid", "atletico madrid"],
+        "vallecano": ["rayo vallecano"],
+        "oviedo": ["real oviedo"],
+        "alaves": ["alavés", "deportivo alavés"],
+    },
+    "BUNDESLIGA": {
+        "fc köln": ["fc cologne", "köln", "cologne"],
+        "fc koln": ["fc cologne", "köln", "cologne"],
+        "m'gladbach": ["borussia mönchengladbach", "mönchengladbach", "monchengladbach"],
+        "mgladbach": ["borussia mönchengladbach", "mönchengladbach", "monchengladbach"],
+        "bremen": ["werder bremen"],
+        "frankfurt": ["eintracht frankfurt"],
+        "leipzig": ["rb leipzig"],
+        "hamburg": ["hamburg sv"],
+        "heidenheim": ["1. fc heidenheim 1846", "heidenheim"],
+        "union berlin": ["1. fc union berlin", "union berlin"],
+        "hoffenheim": ["tsg hoffenheim"],
+        "leverkusen": ["bayer leverkusen"],
+        "dortmund": ["borussia dortmund"],
+        "augsburg": ["fc augsburg"],
+        "stuttgart": ["vfb stuttgart"],
+        "wolfsburg": ["vfl wolfsburg"],
+        "freiburg": ["sc freiburg"],
+    },
+    "NCAABSB": {
+        # Kalshi rarely needs aliases for college baseball; if a 95% rate
+        # isn't hit in dry-run, add team-specific entries here.
+    },
 }
 
 # Strip a leading "Game N:" or "Game N -" prefix before parsing two-team titles.
 # Kalshi uses this for playoff series ("Game 4: Vegas at Anaheim").
 GAME_PREFIX_RE = re.compile(r"^game\s+\d+\s*[:\-]\s*", re.IGNORECASE)
+# Strip a trailing ": Game N" suffix the same way ("X at Y: Game 3").
+GAME_SUFFIX_RE = re.compile(r"\s*[:\-]\s*game\s+\d+\s*$", re.IGNORECASE)
+# Tennis / UFC / boxing Kalshi titles sometimes carry an event prefix
+# ("Netflix MMA Special: Mgoyan vs Morales" or "La Velada del Año VI: ..."):
+# strip the leading "<event-name>: " before parsing the X vs Y pair.
+# Use a non-greedy match so we only strip up to the FIRST ": " on the line
+# (player names rarely contain colons).
+EVENT_PREFIX_RE = re.compile(r"^[^:]*:\s+(?=\S)", re.IGNORECASE)
 
 
 SCHEMA_SQL = """
@@ -226,8 +372,67 @@ def get_lookup_dates() -> list[date]:
 
 # ---------- ESPN scoreboard fetching ----------
 
+def _flatten_tennis_event(sport: str, espn_event: dict) -> list[dict]:
+    """ATP/WTA: ESPN gives one tournament event with many matches inside
+    `groupings[].competitions[]`. Emit one synthetic event per singles match
+    so the rest of the matcher can treat them as ordinary two-competitor
+    games. Doubles is dropped (Kalshi doesn't list doubles money-lines).
+    """
+    target_slug = TENNIS_GROUPING_SLUG.get(sport)
+    out: list[dict] = []
+    for g in espn_event.get("groupings") or []:
+        slug = (g.get("grouping") or {}).get("slug")
+        if target_slug and slug != target_slug:
+            continue
+        for cmp in g.get("competitions") or []:
+            cmps = cmp.get("competitors") or []
+            if len(cmps) != 2:
+                continue
+            # Drop matches where both athletes are TBD (placeholder bracket)
+            names = [(c.get("athlete") or {}).get("displayName") for c in cmps]
+            if not names[0] or not names[1] or "TBD" in names:
+                continue
+            out.append({
+                "id": str(cmp.get("id") or ""),
+                "date": cmp.get("date") or espn_event.get("date"),
+                "name": f"{names[0]} vs {names[1]}",
+                "competitions": [cmp],
+                "_tournament_id": espn_event.get("id"),
+                "_tournament_name": espn_event.get("name"),
+            })
+    return out
+
+
+def _flatten_ufc_event(espn_event: dict) -> list[dict]:
+    """UFC: each ESPN event is a card holding many fights as
+    top-level competitions. Emit one synthetic event per fight."""
+    out: list[dict] = []
+    comps = espn_event.get("competitions") or []
+    for cmp in comps:
+        cmps = cmp.get("competitors") or []
+        if len(cmps) != 2:
+            continue
+        names = [(c.get("athlete") or {}).get("displayName") for c in cmps]
+        if not names[0] or not names[1]:
+            continue
+        out.append({
+            "id": str(cmp.get("id") or ""),
+            "date": cmp.get("date") or espn_event.get("date"),
+            "name": f"{names[0]} vs {names[1]}",
+            "competitions": [cmp],
+            "_card_id": espn_event.get("id"),
+            "_card_name": espn_event.get("name"),
+        })
+    return out
+
+
 def fetch_espn_scoreboard(sport: str, day: date) -> list[dict]:
-    """Fetch ESPN scoreboard for one sport on one day. Returns list of events."""
+    """Fetch ESPN scoreboard for one sport on one day. Returns list of events.
+
+    For athlete sports the upstream scoreboard returns tournament/card-level
+    events containing many matches; we flatten those to one synthetic event
+    per match so the matcher has a uniform shape to work with.
+    """
     url = ESPN_SCOREBOARD.get(sport)
     if not url:
         return []
@@ -235,22 +440,70 @@ def fetch_espn_scoreboard(sport: str, day: date) -> list[dict]:
     try:
         r = requests.get(f"{url}?{urlencode(params)}", timeout=10)
         r.raise_for_status()
-        return r.json().get("events", [])
+        events = r.json().get("events", [])
     except Exception:
         logger.exception("ESPN fetch failed: sport=%s date=%s", sport, day)
         return []
 
+    if sport in ("ATP", "WTA"):
+        flat: list[dict] = []
+        for ev in events:
+            flat.extend(_flatten_tennis_event(sport, ev))
+        return flat
+    if sport == "UFC":
+        flat = []
+        for ev in events:
+            flat.extend(_flatten_ufc_event(ev))
+        return flat
+    # BOXING has no ESPN endpoint -> url is None and we already returned.
+    return events
+
+
+def _event_iso_date(espn_event: dict) -> str | None:
+    """Extract an ISO-formatted UTC date from an ESPN event's `date` field
+    ('YYYY-MM-DDTHH:MMZ'). Used to re-bucket tennis/UFC flattened events
+    by the match's own date instead of the tournament/card's outer date.
+    """
+    s = (espn_event.get("date") or "")
+    if len(s) >= 10:
+        return s[:10]
+    return None
+
 
 def refresh_all_scoreboards() -> dict[tuple[str, str], list[dict]]:
-    """Pull ESPN scoreboards for all four sports across our date window.
+    """Pull ESPN scoreboards for all sports across our date window.
 
     Returns {(sport, 'YYYY-MM-DD'): [espn_events]} cache.
+
+    For tennis and UFC the ESPN response is tournament/card-shaped (one
+    'event' contains many matches/fights). After flattening, we re-bucket
+    by the match's own date rather than the day we queried for, so that
+    a Kalshi match dated MAY05 lands in cache[(sport, '2026-05-05')]
+    even if its tournament shows under a MAY04 query.
     """
     cache: dict[tuple[str, str], list[dict]] = {}
+    seen_match_ids: dict[str, set[str]] = {sport: set() for sport in ESPN_SCOREBOARD}
+
     for sport in ESPN_SCOREBOARD:
         for d in get_lookup_dates():
             evs = fetch_espn_scoreboard(sport, d)
-            cache[(sport, d.isoformat())] = evs
+            if sport in ATHLETE_SPORTS:
+                # Bucket by match-date and dedupe across the day window
+                for ev in evs:
+                    mid = str(ev.get("id") or "")
+                    if mid and mid in seen_match_ids[sport]:
+                        continue
+                    seen_match_ids[sport].add(mid)
+                    iso = _event_iso_date(ev) or d.isoformat()
+                    cache.setdefault((sport, iso), []).append(ev)
+            else:
+                cache[(sport, d.isoformat())] = evs
+
+    # Make sure every (sport, date-in-window) key exists even when empty
+    for sport in ESPN_SCOREBOARD:
+        for d in get_lookup_dates():
+            cache.setdefault((sport, d.isoformat()), [])
+
     total = sum(len(v) for v in cache.values())
     logger.info("ESPN: %d events cached across %d (sport,date) pairs", total, len(cache))
     return cache
@@ -269,9 +522,9 @@ def _to_int_or_none(v):
 
 def _period_label(sport: str, period: int | None, detail: str) -> str | None:
     """Sport-specific human-readable period label."""
-    if sport == "MLB":
+    if sport == "MLB" or sport == "NCAABSB":
         return detail or (f"Inning {period}" if period else None)
-    if sport in ("NBA", "NFL"):
+    if sport in ("NBA", "NFL", "WNBA", "NCAAF"):
         if period and period > 4:
             return f"OT{period - 4}"
         return f"Q{period}" if period else detail or None
@@ -279,53 +532,150 @@ def _period_label(sport: str, period: int | None, detail: str) -> str | None:
         if period and period > 3:
             return "OT" if period == 4 else f"OT{period - 3}"
         return f"P{period}" if period else detail or None
+    if sport in ("EPL", "MLS", "UCL", "LALIGA", "BUNDESLIGA"):
+        # Soccer "period" is half (1 or 2); detail like "65'" or "HT" carries
+        # the live minute, which is what we actually want for the threshold.
+        return detail or (f"H{period}" if period else None)
+    if sport in ("ATP", "WTA"):
+        # Tennis: ESPN status.period == set number; detail like
+        # "1st Set, 2-1" (in-play) or "Final" (settled).
+        return detail or (f"Set {period}" if period else None)
+    if sport == "UFC":
+        # Detail typically "R3 2:34" or "Final"; period is the round.
+        return detail or (f"R{period}" if period else None)
+    if sport == "BOXING":
+        return detail or (f"Round {period}" if period else None)
     return detail or None
 
 
+def _fold(s: str | None) -> str:
+    """Lower-case + strip diacritics (NFKD-fold) so 'Álvarez' compares
+    equal to 'Alvarez', 'Köln' to 'Koln', 'Mönchengladbach' to
+    'Monchengladbach'. Used everywhere we substring-match Kalshi title
+    fragments against ESPN team / athlete names."""
+    if not s:
+        return ""
+    return "".join(
+        c for c in unicodedata.normalize("NFKD", s)
+        if not unicodedata.combining(c)
+    ).lower()
+
+
+def _last_token(name: str) -> str:
+    """Return the diacritic-folded last whitespace-separated token (a rough
+    'last name' for athletes whose displayName is 'First Last'). Returns
+    '' if name is empty/None."""
+    if not name:
+        return ""
+    parts = name.strip().split()
+    return _fold(parts[-1]) if parts else ""
+
+
 def extract_game_state(sport: str, espn_event: dict) -> dict:
-    """Pull normalized game-state fields out of one ESPN event."""
+    """Pull normalized game-state fields out of one ESPN event.
+
+    Team-sport ESPN events have one top-level competition with two team
+    competitors. Athlete-sport scoreboards are flattened upstream into
+    synthetic per-match events whose competitors carry `athlete` instead
+    of `team`; both shapes are handled here.
+    """
     comp = (espn_event.get("competitions") or [{}])[0]
     status = comp.get("status") or {}
     type_ = status.get("type") or {}
     competitors = comp.get("competitors") or []
     away = next((c for c in competitors if c.get("homeAway") == "away"), {})
     home = next((c for c in competitors if c.get("homeAway") == "home"), {})
+    period = _to_int_or_none(status.get("period"))
+    detail = type_.get("detail") or type_.get("shortDetail") or ""
+
+    if sport in ATHLETE_SPORTS:
+        # Athlete events use `competitors[].athlete.{displayName,shortName}`
+        # (team is absent). For symmetry we treat athlete 1 as "away" and
+        # athlete 2 as "home"; ESPN's `homeAway` field is still set on
+        # tennis competitors. The schema column names stay the same.
+        away_ath = (away.get("athlete") or {}) if away else {}
+        home_ath = (home.get("athlete") or {}) if home else {}
+        # Fall back if homeAway wasn't set
+        if not away_ath and not home_ath and len(competitors) == 2:
+            away_ath = (competitors[0].get("athlete") or {})
+            home_ath = (competitors[1].get("athlete") or {})
+
+        away_dn = away_ath.get("displayName")
+        home_dn = home_ath.get("displayName")
+        return {
+            "external_game_id": str(comp.get("id") or espn_event.get("id") or "") or None,
+            "game_status": type_.get("state"),
+            "game_status_detail": detail,
+            "period": period,
+            "period_label": _period_label(sport, period, detail),
+            "clock": status.get("displayClock"),
+            "away_team": away_dn,
+            "home_team": home_dn,
+            "away_score": _to_int_or_none(away.get("score")) if away else None,
+            "home_score": _to_int_or_none(home.get("score")) if home else None,
+            "_away_keys": [
+                _fold(away_dn),
+                _fold(away_ath.get("shortName")),
+                _fold(away_ath.get("fullName")),
+                _last_token(away_dn or ""),
+            ],
+            "_home_keys": [
+                _fold(home_dn),
+                _fold(home_ath.get("shortName")),
+                _fold(home_ath.get("fullName")),
+                _last_token(home_dn or ""),
+            ],
+        }
+
     away_team = (away.get("team") or {})
     home_team = (home.get("team") or {})
-    period = _to_int_or_none(status.get("period"))
 
     return {
         "external_game_id": str(espn_event.get("id") or "") or None,
         "game_status": type_.get("state"),
-        "game_status_detail": type_.get("detail") or type_.get("shortDetail"),
+        "game_status_detail": detail,
         "period": period,
-        "period_label": _period_label(sport, period, type_.get("detail") or ""),
+        "period_label": _period_label(sport, period, detail),
         "clock": status.get("displayClock"),
         "away_team": away_team.get("displayName"),
         "home_team": home_team.get("displayName"),
         "away_score": _to_int_or_none(away.get("score")),
         "home_score": _to_int_or_none(home.get("score")),
         "_away_keys": [
-            (away_team.get("displayName") or "").lower(),
-            (away_team.get("shortDisplayName") or "").lower(),
-            (away_team.get("name") or "").lower(),
-            (away_team.get("nickname") or "").lower(),
-            (away_team.get("abbreviation") or "").lower(),
+            _fold(away_team.get("displayName")),
+            _fold(away_team.get("shortDisplayName")),
+            _fold(away_team.get("name")),
+            _fold(away_team.get("nickname")),
+            _fold(away_team.get("abbreviation")),
         ],
         "_home_keys": [
-            (home_team.get("displayName") or "").lower(),
-            (home_team.get("shortDisplayName") or "").lower(),
-            (home_team.get("name") or "").lower(),
-            (home_team.get("nickname") or "").lower(),
-            (home_team.get("abbreviation") or "").lower(),
+            _fold(home_team.get("displayName")),
+            _fold(home_team.get("shortDisplayName")),
+            _fold(home_team.get("name")),
+            _fold(home_team.get("nickname")),
+            _fold(home_team.get("abbreviation")),
         ],
     }
 
 
 # ---------- Matching Kalshi event -> ESPN event ----------
 
-def _split_kalshi_title(title: str) -> tuple[str, str] | None:
-    cleaned = GAME_PREFIX_RE.sub("", (title or "").strip())
+def _split_kalshi_title(title: str, sport: str = "") -> tuple[str, str] | None:
+    """Split a Kalshi event title into two team/athlete name fragments.
+
+    Strips:
+      - leading "Game N:" playoff prefix (existing)
+      - trailing ": Game N" playoff suffix (WNBA, etc.)
+      - leading "<event>: " naming for athlete sports ("Netflix MMA Special:",
+        "La Velada del Año VI:", etc.) — only applied for ATHLETE_SPORTS
+        because team sports occasionally legitimately use ":" (e.g. team
+        nicknames; defensive).
+    """
+    cleaned = (title or "").strip()
+    cleaned = GAME_PREFIX_RE.sub("", cleaned)
+    cleaned = GAME_SUFFIX_RE.sub("", cleaned)
+    if sport in ATHLETE_SPORTS:
+        cleaned = EVENT_PREFIX_RE.sub("", cleaned)
     parts = re.split(r"\s+vs\.?\s+|\s+@\s+|\s+at\s+", cleaned, flags=re.IGNORECASE)
     if len(parts) != 2:
         return None
@@ -335,9 +685,36 @@ def _split_kalshi_title(title: str) -> tuple[str, str] | None:
     return a, b
 
 
+def _normalize_team_name(parsed: str) -> list[str]:
+    """Yield additional probe variants for a parsed team name. Currently:
+       - strip parenthetical disambiguation: 'miami (fl)' -> 'miami'
+    """
+    extras: list[str] = []
+    stripped = re.sub(r"\s*\([^)]*\)\s*", " ", parsed).strip()
+    if stripped and stripped != parsed:
+        extras.append(stripped)
+    return extras
+
+
 def _expand_aliases(sport: str, parsed_name: str) -> list[str]:
-    """Return [parsed_name] + any aliases for this team. Each is a probe to try."""
-    return [parsed_name] + TEAM_ALIASES.get(sport, {}).get(parsed_name, [])
+    """Return [parsed_name] + normalization variants + any aliases, all
+    diacritic-folded. Each is a probe tried as a substring against ESPN
+    team/athlete name keys (which are also folded)."""
+    probes = [parsed_name]
+    probes.extend(_normalize_team_name(parsed_name))
+    probes.extend(TEAM_ALIASES.get(sport, {}).get(parsed_name, []))
+    # Also try aliases against the normalized variant
+    for v in _normalize_team_name(parsed_name):
+        probes.extend(TEAM_ALIASES.get(sport, {}).get(v, []))
+    # Fold to ascii lower, drop empties / duplicates while preserving order
+    seen = set()
+    out = []
+    for p in probes:
+        f = _fold(p)
+        if f and f not in seen:
+            seen.add(f)
+            out.append(f)
+    return out
 
 
 def match_kalshi_to_espn(
@@ -350,7 +727,7 @@ def match_kalshi_to_espn(
     """
     title = event.get("title") or ""
     et = event.get("event_ticker") or ""
-    parsed = _split_kalshi_title(title)
+    parsed = _split_kalshi_title(title, sport=sport)
     d = parse_kalshi_ticker_date(et)
     candidates: list[dict] = []
 
@@ -359,9 +736,16 @@ def match_kalshi_to_espn(
     # gets stamped with today's "Bottom 2nd" state). Only fall back to
     # adjacent days if exact date returns zero candidates (possible TZ-edge
     # late games where the ESPN bucket is one day off).
+    #
+    # Athlete sports (tennis especially) ALWAYS include ±1 day because the
+    # ESPN match-date can be a UTC offset from the Kalshi ticker date for
+    # late-night/early-morning matches across continents.
     if d is not None:
         candidates = list(espn_cache.get((sport, d.isoformat()), []))
-        if not candidates:
+        if sport in ATHLETE_SPORTS:
+            for off in (-1, 1):
+                candidates.extend(espn_cache.get((sport, (d + timedelta(days=off)).isoformat()), []))
+        elif not candidates:
             for off in (-1, 1):
                 candidates.extend(espn_cache.get((sport, (d + timedelta(days=off)).isoformat()), []))
     else:
@@ -442,7 +826,7 @@ def split_markets_by_team(markets: list[dict], state: dict | None) -> tuple[dict
     home_keys = state["_home_keys"]
     away_m = home_m = None
     for m in markets:
-        sub = (m.get("yes_sub_title") or m.get("subtitle") or "").lower()
+        sub = _fold(m.get("yes_sub_title") or m.get("subtitle") or "")
         if not sub:
             continue
         for k in away_keys:
@@ -480,14 +864,19 @@ def has_recent_snapshot(event_ticker: str, cooldown_seconds: int) -> bool:
 
 
 def _summarize_candidates(sport: str, cands: list[dict]) -> str:
-    """JSON-encode candidate ESPN games for the failure log."""
+    """JSON-encode candidate ESPN games for the failure log.
+    Handles both team and athlete shapes."""
     out = []
     for c in cands[:8]:
         comp = (c.get("competitions") or [{}])[0]
         teams = []
         for t in comp.get("competitors", []):
             tt = t.get("team") or {}
-            teams.append({"name": tt.get("displayName"), "abbrev": tt.get("abbreviation")})
+            ath = t.get("athlete") or {}
+            teams.append({
+                "name": tt.get("displayName") or ath.get("displayName"),
+                "abbrev": tt.get("abbreviation") or ath.get("shortName"),
+            })
         out.append({"id": c.get("id"), "date": c.get("date"), "teams": teams})
     return json.dumps(out)
 
